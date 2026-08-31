@@ -1,0 +1,10 @@
+Hello {{ full_name }},
+
+Your meeting request has been successfully scheduled for {{ preferred_date|date:"F j, Y" }} at {{ preferred_time }}.
+
+The Kraios admin will meet you at the scheduled date and time.
+
+If you did not submit this request, contact us at {{ support_email }}.
+
+Kraios Team
+

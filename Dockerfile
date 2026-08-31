@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY --chown=django:django . .
 
+RUN mkdir -p /app/media && chown django:django /app/media
+
 USER django
 
 EXPOSE 8000

@@ -15,6 +15,18 @@ services:
       retries: 10
       start_period: 10s
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   web:
     build: .
     restart: unless-stopped
@@ -23,13 +35,14 @@ services:
     command: >
       sh -c "python manage.py migrate &&
              python manage.py collectstatic --noinput &&
-             gunicorn config.wsgi:application
-             --bind 0.0.0.0:8000
-             --workers 3
-             --timeout 60"
+             daphne -b 0.0.0.0 -p 8000 config.asgi:application"
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -37,11 +50,29 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/admin/login/', timeout=3)"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/', timeout=3)"
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
 
+  worker:
+    build: .
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+    env_file:
+      - .env
+    command: celery -A config worker --loglevel=info --concurrency=2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+
 volumes:
   postgres_data:
+  redis_data:
+  media_data:

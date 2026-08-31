@@ -42,11 +42,15 @@ CORS_ALLOWED_ORIGINS = [
     for origin in cors_origins_value.split(',')
     if origin.strip()
 ]
+# Authentication uses HttpOnly cookies, so browsers must be explicitly allowed
+# to include and receive cookies on approved cross-origin API requests.
+CORS_ALLOW_CREDENTIALS = True
 CORS_URLS_REGEX = r'^/api/.*$'
 
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -57,6 +61,8 @@ INSTALLED_APPS = [
     'corsheaders',
     'rest_framework_simplejwt.token_blacklist',
     'accounts',
+    'profiles',
+    'projects',
 ]
 
 MIDDLEWARE = [
@@ -89,6 +95,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = 'config.asgi.application'
 
 
 # Database
@@ -153,6 +160,8 @@ USE_TZ = True
 
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 
 if DEBUG:
     staticfiles_backend = 'django.contrib.staticfiles.storage.StaticFilesStorage'
@@ -185,6 +194,10 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_THROTTLE_RATES': {
+        'profile_otp': '5/hour',
+        'password_reset': '10/hour',
+    },
 }
 
 AUTH_ACCESS_COOKIE_NAME = 'kraios_access' if DEBUG else '__Host-kraios_access'
@@ -199,6 +212,7 @@ SIMPLE_JWT = {
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'ROTATE_REFRESH_TOKENS': True,
     'BLACKLIST_AFTER_ROTATION': True,
+    'CHECK_REVOKE_TOKEN': True,
 }
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
@@ -207,3 +221,67 @@ SECURE_SSL_REDIRECT = (
 )
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
+
+DEFAULT_FROM_EMAIL = os.environ.get('DJANGO_DEFAULT_FROM_EMAIL', 'noreply@kraios.local')
+EMAIL_BACKEND = os.environ.get(
+    'DJANGO_EMAIL_BACKEND',
+    'django.core.mail.backends.console.EmailBackend',
+)
+EMAIL_HOST = os.environ.get('DJANGO_EMAIL_HOST', '')
+EMAIL_PORT = int(os.environ.get('DJANGO_EMAIL_PORT', '587'))
+EMAIL_HOST_USER = os.environ.get('DJANGO_EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('DJANGO_EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.environ.get('DJANGO_EMAIL_USE_TLS', 'True').lower() == 'true'
+EMAIL_USE_SSL = os.environ.get('DJANGO_EMAIL_USE_SSL', 'False').lower() == 'true'
+EMAIL_TIMEOUT = int(os.environ.get('DJANGO_EMAIL_TIMEOUT', '15'))
+KRAIOS_SUPPORT_EMAIL = os.environ.get(
+    'KRAIOS_SUPPORT_EMAIL',
+    EMAIL_HOST_USER or DEFAULT_FROM_EMAIL,
+)
+
+if EMAIL_USE_TLS and EMAIL_USE_SSL:
+    raise RuntimeError(
+        'Use either DJANGO_EMAIL_USE_TLS or DJANGO_EMAIL_USE_SSL, not both.'
+    )
+
+PROJECT_UPLOAD_MAX_BYTES = int(
+    os.environ.get('PROJECT_UPLOAD_MAX_BYTES', 25 * 1024 * 1024)
+)
+AI_PLACEHOLDER_DELAY_SECONDS = int(
+    os.environ.get('AI_PLACEHOLDER_DELAY_SECONDS', '5')
+)
+
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://redis:6379/0')
+
+if DEBUG:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'kraios-development-cache',
+        }
+    }
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': REDIS_URL.replace('/0', '/1'),
+        }
+    }
+
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = int(os.environ.get('CELERY_TASK_TIME_LIMIT', '1200'))
+CELERY_TASK_SOFT_TIME_LIMIT = int(
+    os.environ.get('CELERY_TASK_SOFT_TIME_LIMIT', '1140')
+)
+CELERY_TASK_ALWAYS_EAGER = (
+    os.environ.get('CELERY_TASK_ALWAYS_EAGER', 'False').lower() == 'true'
+)
+
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {'hosts': [REDIS_URL]},
+    },
+}

@@ -1,9 +1,11 @@
 # Kraios Backend: Docker and VPS Setup
 
-This project uses the same two-container stack locally and on the VPS:
+This project uses the same application stack locally and on the VPS:
 
-- `web`: Django served by Gunicorn
+- `web`: Django served by Daphne (HTTP and WebSockets)
 - `db`: PostgreSQL 18
+- `redis`: Celery broker and Channels message layer
+- `worker`: Celery background worker for generation and archives
 
 The database is stored in the named Docker volume `postgres_data`. The web port is bound to `127.0.0.1:8000`, so PostgreSQL is never exposed and the VPS can publish the API through Nginx.
 
@@ -54,6 +56,19 @@ POSTGRES_USER=kraios_user
 POSTGRES_PASSWORD=a-local-database-password
 POSTGRES_HOST=db
 POSTGRES_PORT=5432
+REDIS_URL=redis://redis:6379/0
+AI_PLACEHOLDER_DELAY_SECONDS=5
+
+# Use real SMTP for signup confirmation, password, and account-deletion emails.
+DJANGO_DEFAULT_FROM_EMAIL="Kraios <noreply@example.com>"
+DJANGO_EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
+DJANGO_EMAIL_HOST=smtp.example.com
+DJANGO_EMAIL_PORT=587
+DJANGO_EMAIL_HOST_USER=SMTP_USERNAME
+DJANGO_EMAIL_HOST_PASSWORD=SMTP_PASSWORD
+DJANGO_EMAIL_USE_TLS=True
+DJANGO_EMAIL_USE_SSL=False
+KRAIOS_SUPPORT_EMAIL=support@example.com
 ```
 
 Never commit `.env`. It is already listed in `.gitignore` and `.dockerignore`.
@@ -68,12 +83,13 @@ docker compose ps
 
 If port `8000` is already in use, stop the existing application using it before starting this stack. Do not change the public binding on a VPS to `0.0.0.0` unless you intentionally want to bypass Nginx.
 
-The `web` container waits for PostgreSQL to become healthy, runs migrations, collects static files, and starts Gunicorn.
+The `web` container waits for PostgreSQL and Redis, runs migrations, collects static files, and starts Daphne. The worker handles long-running jobs.
 
 View logs:
 
 ```bash
 docker compose logs -f web
+docker compose logs -f worker
 ```
 
 Press `Ctrl+C` to leave the logs. The containers keep running.
@@ -88,6 +104,8 @@ Open:
 
 - Admin: `http://localhost:8000/admin/`
 - Signup API: `http://localhost:8000/api/v1/auth/signup-request/`
+- Forgot-password request: `http://localhost:8000/api/v1/auth/forgot-password/request/`
+- Forgot-password confirm: `http://localhost:8000/api/v1/auth/forgot-password/confirm/`
 - Login API: `http://localhost:8000/api/v1/auth/login/`
 - Current user API: `http://localhost:8000/api/v1/auth/me/`
 
@@ -221,6 +239,8 @@ POSTGRES_USER=kraios_user
 POSTGRES_PASSWORD=PASTE_THE_SECOND_RANDOM_VALUE
 POSTGRES_HOST=db
 POSTGRES_PORT=5432
+REDIS_URL=redis://redis:6379/0
+AI_PLACEHOLDER_DELAY_SECONDS=5
 ```
 
 Keep `DJANGO_SECURE_SSL_REDIRECT=False` until HTTPS has been issued successfully.
@@ -310,6 +330,8 @@ sudo ufw status
 ```
 
 Port `8000` does not need a public firewall rule because Compose binds it only to `127.0.0.1`.
+
+Nginx must forward WebSocket upgrades for `/ws/`. The supplied configuration already includes the required upgrade headers.
 
 ## 3. Common VPS operations
 

@@ -1,3 +1,6 @@
+import re
+
+from django.core import mail
 from django.urls import reverse
 from django.conf import settings
 from django.test import TestCase
@@ -6,6 +9,10 @@ from rest_framework.test import APITestCase
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from .emails import (
+    FORGOT_PASSWORD_OTP_TEMPLATE_ID,
+    SIGNUP_MEETING_CONFIRMATION_TEMPLATE_ID,
+)
 from .models import SignupRequest, User
 
 
@@ -26,6 +33,7 @@ class SignupRequestAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['status'], SignupRequest.PENDING)
+        self.assertTrue(response.data['confirmation_email_sent'])
 
         user = User.objects.get(email='ayesha@example.com')
         self.assertFalse(user.is_active)
@@ -37,6 +45,14 @@ class SignupRequestAPITests(APITestCase):
         signup_request = SignupRequest.objects.get(user=user)
         self.assertEqual(str(signup_request.preferred_date), self.payload['date'])
         self.assertEqual(signup_request.preferred_time, self.payload['time'])
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(
+            mail.outbox[0].extra_headers['X-Kraios-Template-ID'],
+            SIGNUP_MEETING_CONFIRMATION_TEMPLATE_ID,
+        )
+        self.assertIn('September 15, 2026', mail.outbox[0].body)
+        self.assertIn(self.payload['time'], mail.outbox[0].body)
+        self.assertEqual(mail.outbox[0].to, ['ayesha@example.com'])
 
     def test_signup_rejects_duplicate_email(self):
         self.client.post(self.url, self.payload, format='json')
@@ -58,6 +74,93 @@ class SignupRequestAPITests(APITestCase):
             set(response.data.keys()),
             {'name', 'firm', 'email', 'country', 'date', 'time'},
         )
+
+
+class ForgotPasswordAPITests(APITestCase):
+    def setUp(self):
+        self.request_url = reverse('accounts:forgot-password-request')
+        self.confirm_url = reverse('accounts:forgot-password-confirm')
+        self.old_password = 'StrongInitialPassword123!'
+        self.new_password = 'EvenStrongerPassword456!'
+        self.user = User.objects.create_user(
+            email='forgot@example.com',
+            password=self.old_password,
+            full_name='Forgot Password User',
+            firm_name='Test Firm',
+            country='Pakistan',
+            is_active=True,
+        )
+
+    def otp_from_latest_email(self):
+        match = re.search(r'\b(\d{6})\b', mail.outbox[-1].body)
+        self.assertIsNotNone(match)
+        return match.group(1)
+
+    def test_user_can_request_and_confirm_password_reset(self):
+        request_response = self.client.post(
+            self.request_url,
+            {'email': 'FORGOT@example.com'},
+            format='json',
+        )
+
+        self.assertEqual(request_response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(
+            mail.outbox[0].extra_headers['X-Kraios-Template-ID'],
+            FORGOT_PASSWORD_OTP_TEMPLATE_ID,
+        )
+        self.assertTrue(mail.outbox[0].alternatives)
+
+        confirm_response = self.client.post(
+            self.confirm_url,
+            {
+                'email': self.user.email,
+                'verification_id': request_response.data['verification_id'],
+                'otp': self.otp_from_latest_email(),
+                'new_password': self.new_password,
+            },
+            format='json',
+        )
+
+        self.assertEqual(confirm_response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.new_password))
+        self.assertFalse(self.user.check_password(self.old_password))
+
+    def test_unknown_email_returns_generic_success_without_email(self):
+        response = self.client.post(
+            self.request_url,
+            {'email': 'missing@example.com'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertIn('verification_id', response.data)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_password_reset_rejects_wrong_otp(self):
+        request_response = self.client.post(
+            self.request_url,
+            {'email': self.user.email},
+            format='json',
+        )
+        actual_otp = self.otp_from_latest_email()
+        wrong_otp = '000000' if actual_otp != '000000' else '000001'
+
+        response = self.client.post(
+            self.confirm_url,
+            {
+                'email': self.user.email,
+                'verification_id': request_response.data['verification_id'],
+                'otp': wrong_otp,
+                'new_password': self.new_password,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.old_password))
 
 
 class AuthenticationAPITests(APITestCase):

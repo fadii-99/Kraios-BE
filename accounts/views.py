@@ -1,5 +1,9 @@
+import logging
+import uuid
+
 from django.conf import settings
 from django.contrib.auth import authenticate
+from django.db import transaction
 from django.middleware.csrf import get_token
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -12,9 +16,26 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
-from django.contrib.auth.hashers import make_password
+
+from .emails import send_signup_meeting_confirmation
 from .models import User
-from .serializers import LoginSerializer, SignupRequestSerializer, UserProfileSerializer
+from .serializers import (
+    ForgotPasswordConfirmSerializer,
+    ForgotPasswordRequestSerializer,
+    LoginSerializer,
+    SignupRequestSerializer,
+    UserProfileSerializer,
+)
+from profiles.models import AccountVerification
+from profiles.services import (
+    blacklist_user_refresh_tokens,
+    consume_account_verification,
+    create_account_verification,
+)
+from profiles.throttles import PasswordResetThrottle
+
+
+logger = logging.getLogger(__name__)
 
 
 def enforce_csrf(request):
@@ -70,12 +91,96 @@ class SignupRequestAPIView(APIView):
         serializer.is_valid(raise_exception=True)
         signup_request = serializer.save()
 
+        try:
+            email_sent = bool(send_signup_meeting_confirmation(signup_request))
+        except Exception:
+            email_sent = False
+            logger.exception(
+                'Could not send signup confirmation email for request %s.',
+                signup_request.id,
+            )
+
         response_data = {
             'message': 'Sign-up request submitted successfully.',
             'request_id': signup_request.id,
             'status': signup_request.status,
+            'confirmation_email_sent': email_sent,
         }
         return Response(response_data, status=status.HTTP_201_CREATED)
+
+
+class ForgotPasswordRequestAPIView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [PasswordResetThrottle]
+
+    def post(self, request):
+        enforce_csrf(request)
+        serializer = ForgotPasswordRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        verification_id = uuid.uuid4()
+        user = User.objects.filter(
+            email__iexact=serializer.validated_data['email'],
+            is_active=True,
+        ).first()
+        if user is not None:
+            verification = create_account_verification(
+                user,
+                AccountVerification.PASSWORD_RESET,
+            )
+            verification_id = verification.id
+
+        return Response(
+            {
+                'detail': (
+                    'If an active account exists for this email, '
+                    'a verification code has been sent.'
+                ),
+                'verification_id': verification_id,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class ForgotPasswordConfirmAPIView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [PasswordResetThrottle]
+
+    def post(self, request):
+        enforce_csrf(request)
+        email = str(request.data.get('email', '')).lower()
+        user = User.objects.filter(email__iexact=email, is_active=True).first()
+        serializer = ForgotPasswordConfirmSerializer(
+            data=request.data,
+            context={'user': user},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        if user is None:
+            return Response(
+                {'otp': ['Invalid or expired verification code.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        consume_account_verification(
+            user,
+            serializer.validated_data['verification_id'],
+            AccountVerification.PASSWORD_RESET,
+            serializer.validated_data['otp'],
+        )
+
+        with transaction.atomic():
+            user.set_password(serializer.validated_data['new_password'])
+            user.save(update_fields=['password'])
+            blacklist_user_refresh_tokens(user)
+
+        response = Response(
+            {'detail': 'Password reset successfully. Please log in.'}
+        )
+        clear_auth_cookies(response)
+        return response
 
 
 class CsrfAPIView(APIView):
@@ -99,16 +204,16 @@ class LoginAPIView(APIView):
 
     def post(self, request):
         enforce_csrf(request)
+        from django.contrib.auth.hashers import make_password
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         email = serializer.validated_data['email']
         password = serializer.validated_data['password']
-        print(email)
 
         try:
             user = User.objects.get(email=email)
-            # user.password=make_password('123456789')
-            # user.is_active=True
+            # user.password = make_password("123456789")
+            # user.is_active = True
             # user.save()
         except User.DoesNotExist:
             return Response(
