@@ -10,6 +10,7 @@ from .views import (
     BOQVersionListAPIView,
     ConversationMessageDeleteAPIView,
     FloorPlanConversationAPIView,
+    FloorPlanAnalyzeAPIView,
     FloorPlanEditAPIView,
     FloorPlanGenerateAPIView,
     FloorPlanHistoryAPIView,
@@ -32,6 +33,7 @@ from .views import (
     ThreeDGenerateAPIView,
     ThreeDHistoryAPIView,
     ThreeDSelectAPIView,
+    ThreeDSnapshotUploadAPIView,
 )
 
 
@@ -95,6 +97,16 @@ urlpatterns = [
         '<uuid:project_id>/step-2/input/',
         StepTwoInputUploadAPIView.as_view(),
         name='step-two-input',
+    ),
+    path(
+        '<uuid:project_id>/step-2/analyze/',
+        FloorPlanAnalyzeAPIView.as_view(),
+        name='floor-plan-analyze',
+    ),
+    path(
+        '<uuid:project_id>/step-2/snapshots/',
+        ThreeDSnapshotUploadAPIView.as_view(),
+        name='three-d-snapshot-upload',
     ),
     path(
         '<uuid:project_id>/step-2/history/',

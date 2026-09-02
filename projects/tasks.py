@@ -2,6 +2,7 @@ import base64
 import json
 import shutil
 import tempfile
+import threading
 import time
 import zipfile
 
@@ -11,7 +12,7 @@ from channels.layers import get_channel_layer
 from django.conf import settings
 from django.core.files import File
 from django.core.files.base import ContentFile
-from django.db import transaction
+from django.db import connections, transaction
 from django.utils import timezone
 
 from .models import (
@@ -63,6 +64,83 @@ def update_job(job, **changes):
     notify_job(job)
 
 
+class JobHeartbeat:
+    """Keep reporting progress while a long AI call runs.
+
+    A generation used to emit progress 15, then nothing at all until the
+    pipeline returned — over a minute of silence for a BOQ turn. The client
+    has no way to tell that apart from a dead job, so it showed a failure
+    with a retry button for work that was in fact still running and would
+    succeed. Idle WebSocket connections also get dropped by proxies in that
+    window. So the job reports in on an interval instead.
+
+    Progress creeps toward CEILING and never reaches it: the real 90 and 100
+    are published by the task itself once the pipeline is actually done, and
+    the bar must never go backwards.
+
+    Runs as a thread beside the pipeline. Every write is a targeted UPDATE
+    filtered on the job still being PROCESSING, so it can neither clobber
+    the fields the task owns nor resurrect a job that failed or was closed
+    out from elsewhere.
+    """
+
+    INTERVAL_SECONDS = 10
+    FLOOR = 15
+    CEILING = 85
+    STEP = 5
+
+    def __init__(self, job):
+        self._job_id = job.id
+        self._progress = max(job.progress, self.FLOOR)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        self._thread = threading.Thread(
+            target=self._run, name=f'job-heartbeat-{self._job_id}', daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.INTERVAL_SECONDS)
+        return False
+
+    def _run(self):
+        try:
+            while not self._stop.wait(self.INTERVAL_SECONDS):
+                self._tick()
+        finally:
+            # This thread opened its own connection; the worker will not.
+            connections.close_all()
+
+    def _tick(self):
+        self._progress = min(self._progress + self.STEP, self.CEILING)
+        updated = ProcessingJob.objects.filter(
+            id=self._job_id,
+            status=ProcessingJob.PROCESSING,
+        ).update(
+            progress=self._progress,
+            message='The AI pipeline is still working on this.',
+            updated_at=timezone.now(),
+        )
+        if not updated:
+            self._stop.set()
+            return
+
+        job = ProcessingJob.objects.filter(id=self._job_id).first()
+        if job is None:
+            return
+        try:
+            notify_job(job)
+        except Exception:
+            # The saved progress above is what the REST poller reads, so a
+            # channel-layer hiccup must not stop the heartbeat.
+            pass
+
+
 def run_placeholder_processing(job):
     delay_seconds = max(0, settings.AI_PLACEHOLDER_DELAY_SECONDS)
     checkpoints = [15, 35, 60, 85]
@@ -93,13 +171,40 @@ def create_placeholder_image(job, kind, label):
     return asset
 
 
-def complete_floor_plan_job(job):
+def create_generated_image(job, kind, output):
+    asset = ProjectAsset(
+        project=job.project,
+        uploaded_by=job.created_by,
+        kind=kind,
+        original_name=output.filename,
+        content_type=output.content_type,
+        size=len(output.content),
+        metadata=output.metadata,
+    )
+    asset.file.save(
+        output.filename,
+        ContentFile(output.content),
+        save=True,
+    )
+    return asset
+
+
+def complete_floor_plan_job(job, pipeline_output=None):
     version = job.floor_plan_version
-    asset = create_placeholder_image(
-        job,
-        ProjectAsset.FLOOR_PLAN,
-        'floor-plan',
-    )
+    if pipeline_output is None:
+        asset = create_placeholder_image(
+            job,
+            ProjectAsset.FLOOR_PLAN,
+            'floor-plan',
+        )
+        assistant_content = 'The placeholder 2D floor-plan generation has completed.'
+    else:
+        asset = create_generated_image(
+            job,
+            ProjectAsset.FLOOR_PLAN,
+            pipeline_output,
+        )
+        assistant_content = 'Your 2D floor plan is ready for review.'
     version.image = asset
     version.status = ProcessingJob.COMPLETED
     version.completed_at = timezone.now()
@@ -109,19 +214,28 @@ def complete_floor_plan_job(job):
         message = ConversationMessage.objects.create(
             conversation=version.prompt_message.conversation,
             role=ConversationMessage.ASSISTANT,
-            content='The placeholder 2D floor-plan generation has completed.',
+            content=assistant_content,
         )
         message.attachments.add(asset)
     return asset
 
 
-def complete_three_d_job(job):
+def complete_three_d_job(job, pipeline_output=None):
     version = job.three_d_version
-    asset = create_placeholder_image(
-        job,
-        ProjectAsset.THREE_D_IMAGE,
-        'three-d',
-    )
+    if pipeline_output is None:
+        asset = create_placeholder_image(
+            job,
+            ProjectAsset.THREE_D_IMAGE,
+            'three-d',
+        )
+        assistant_content = 'The placeholder 3D generation has completed.'
+    else:
+        asset = create_generated_image(
+            job,
+            ProjectAsset.THREE_D_IMAGE,
+            pipeline_output,
+        )
+        assistant_content = 'Your 3D render is ready for review.'
     version.image = asset
     version.status = ProcessingJob.COMPLETED
     version.completed_at = timezone.now()
@@ -131,28 +245,44 @@ def complete_three_d_job(job):
         message = ConversationMessage.objects.create(
             conversation=version.prompt_message.conversation,
             role=ConversationMessage.ASSISTANT,
-            content='The placeholder 3D generation has completed.',
+            content=assistant_content,
         )
         message.attachments.add(asset)
     return asset
 
 
-def complete_boq_job(job):
+def complete_floor_plan_analysis_job(job, pipeline_output):
+    asset = pipeline_output.asset
+    asset.metadata = pipeline_output.metadata
+    asset.save(update_fields=['metadata'])
+    return asset
+
+
+def complete_boq_job(job, pipeline_output=None):
     version = job.boq_version
-    version.structured_data = {
-        'columns': ['Item', 'Description', 'Quantity', 'Unit', 'Rate', 'Amount'],
-        'rows': [
-            {
-                'Item': '1',
-                'Description': 'Placeholder construction item',
-                'Quantity': 1,
-                'Unit': 'item',
-                'Rate': 0,
-                'Amount': 0,
-            }
-        ],
-        'placeholder': True,
-    }
+    workflow_pending = False
+    if pipeline_output is None:
+        version.structured_data = {
+            'columns': ['Item', 'Description', 'Quantity', 'Unit', 'Rate', 'Amount'],
+            'rows': [
+                {
+                    'Item': '1',
+                    'Description': 'Placeholder construction item',
+                    'Quantity': 1,
+                    'Unit': 'item',
+                    'Rate': 0,
+                    'Amount': 0,
+                }
+            ],
+            'placeholder': True,
+        }
+        assistant_content = f'BOQ version {version.version_number} is ready.'
+    else:
+        version.structured_data = pipeline_output.structured_data
+        assistant_content = pipeline_output.response_text
+        workflow_pending = bool(
+            pipeline_output.structured_data.get('workflow_pending')
+        )
     version.status = ProcessingJob.COMPLETED
     version.completed_at = timezone.now()
     version.save(update_fields=['structured_data', 'status', 'completed_at'])
@@ -160,8 +290,10 @@ def complete_boq_job(job):
         ConversationMessage.objects.create(
             conversation=version.source_message.conversation,
             role=ConversationMessage.ASSISTANT,
-            content=f'BOQ version {version.version_number} is ready.',
+            content=assistant_content,
         )
+    if workflow_pending:
+        version.delete()
     return None
 
 
@@ -183,7 +315,9 @@ def complete_archive_job(job):
 
     with zipfile.ZipFile(archive_buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
         scope = job.parameters.get('scope', 'ALL')
-        assets = job.project.assets.exclude(kind=ProjectAsset.ARCHIVE)
+        assets = job.project.assets.exclude(
+            kind__in=[ProjectAsset.ARCHIVE, ProjectAsset.THREE_D_SNAPSHOT]
+        )
         if scope == 'FLOOR_PLANS':
             assets = assets.filter(kind=ProjectAsset.FLOOR_PLAN)
         elif scope == 'THREE_D':
@@ -246,22 +380,55 @@ def process_job(job_id):
     )
 
     try:
-        run_placeholder_processing(job)
+        pipeline_output = None
+        if job.job_type == ProcessingJob.PROJECT_ARCHIVE:
+            update_job(
+                job,
+                progress=35,
+                message='Preparing the project archive.',
+            )
+        elif settings.AI_PIPELINE_ENABLED:
+            update_job(
+                job,
+                progress=15,
+                message='Preparing inputs for the AI pipeline.',
+            )
+            from .ai_pipeline import execute_ai_job
+
+            # A render or BOQ turn runs for a minute or more with nothing to
+            # report in between; without a heartbeat the client cannot tell
+            # that from a dead job.
+            with JobHeartbeat(job):
+                pipeline_output = execute_ai_job(job)
+            update_job(
+                job,
+                progress=90,
+                message='AI processing finished. Saving the result.',
+            )
+        else:
+            run_placeholder_processing(job)
 
         with transaction.atomic():
-            if job.job_type in {
+            if job.job_type == ProcessingJob.FLOOR_PLAN_ANALYZE:
+                if pipeline_output is None:
+                    raise RuntimeError('Floor-plan analysis requires the AI pipeline.')
+                output_asset = complete_floor_plan_analysis_job(
+                    job,
+                    pipeline_output,
+                )
+            elif job.job_type in {
                 ProcessingJob.FLOOR_PLAN_GENERATE,
                 ProcessingJob.FLOOR_PLAN_EDIT,
             }:
-                output_asset = complete_floor_plan_job(job)
+                output_asset = complete_floor_plan_job(job, pipeline_output)
             elif job.job_type in {
                 ProcessingJob.THREE_D_GENERATE,
                 ProcessingJob.THREE_D_EDIT,
                 ProcessingJob.THREE_D_ANGLE,
             }:
-                output_asset = complete_three_d_job(job)
+                output_asset = complete_three_d_job(job, pipeline_output)
             elif job.job_type == ProcessingJob.BOQ_GENERATE:
-                output_asset = complete_boq_job(job)
+                output_asset = complete_boq_job(job, pipeline_output)
             elif job.job_type == ProcessingJob.PROJECT_ARCHIVE:
                 output_asset = complete_archive_job(job)
             else:

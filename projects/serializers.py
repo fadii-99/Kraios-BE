@@ -253,6 +253,7 @@ class ProjectSerializer(serializers.ModelSerializer):
 class PromptSerializer(serializers.Serializer):
     prompt = serializers.CharField(max_length=5000)
     parent_version_id = serializers.UUIDField(required=False)
+    retry_message_id = serializers.UUIDField(required=False)
 
 
 class FloorPlanEditSerializer(serializers.Serializer):
@@ -261,9 +262,40 @@ class FloorPlanEditSerializer(serializers.Serializer):
     mask = serializers.FileField()
 
 
+class FloorPlanAnalyzeSerializer(serializers.Serializer):
+    floor_plan_version_id = serializers.UUIDField(required=False)
+
+
+class ThreeDSnapshotUploadSerializer(serializers.Serializer):
+    file = serializers.FileField()
+    floor_plan_version_id = serializers.UUIDField()
+    rooms = serializers.JSONField(required=False, default=list)
+
+    def validate_rooms(self, rooms):
+        if not isinstance(rooms, list):
+            raise serializers.ValidationError('Rooms must be a JSON array.')
+        if len(rooms) > 500:
+            raise serializers.ValidationError('At most 500 rooms are supported.')
+        for room in rooms:
+            if not isinstance(room, (dict, str)):
+                raise serializers.ValidationError(
+                    'Every room must be an object or a room name.'
+                )
+        return rooms
+
+
 class ThreeDGenerateSerializer(serializers.Serializer):
     prompt = serializers.CharField(max_length=5000)
+    retry_message_id = serializers.UUIDField(required=False)
     floor_plan_version_id = serializers.UUIDField(required=False)
+    snapshot_asset_id = serializers.UUIDField(required=False)
+    original_version_id = serializers.UUIDField(required=False)
+    style_reference_asset_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        default=list,
+        max_length=5,
+    )
     render_style = serializers.ChoiceField(
         choices=ThreeDVersion.RENDER_STYLE_CHOICES,
         default=ThreeDVersion.SKETCHUP,
@@ -278,11 +310,17 @@ class ThreeDEditSerializer(serializers.Serializer):
 
 class ThreeDAngleSerializer(serializers.Serializer):
     original_version_id = serializers.UUIDField()
-    angle = serializers.ChoiceField(choices=ThreeDVersion.ANGLE_CHOICES)
+    # ORIGINAL is the camera an existing render already has, so the isometric
+    # 45-degree view is the only angle this endpoint can produce.
+    angle = serializers.ChoiceField(
+        choices=[(ThreeDVersion.ISOMETRIC_45, 'Isometric 45 degrees')],
+        default=ThreeDVersion.ISOMETRIC_45,
+    )
 
 
 class BOQGenerateSerializer(serializers.Serializer):
     prompt = serializers.CharField(max_length=5000)
+    retry_message_id = serializers.UUIDField(required=False)
 
 
 class BOQManualVersionSerializer(serializers.Serializer):

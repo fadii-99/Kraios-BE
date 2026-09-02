@@ -1,6 +1,7 @@
 import csv
 import json
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
@@ -28,6 +29,7 @@ from .serializers import (
     BOQVersionSerializer,
     ConversationMessageSerializer,
     FloorPlanEditSerializer,
+    FloorPlanAnalyzeSerializer,
     FloorPlanVersionSerializer,
     ProcessingJobSerializer,
     ProjectArchiveRequestSerializer,
@@ -40,12 +42,14 @@ from .serializers import (
     ThreeDAngleSerializer,
     ThreeDEditSerializer,
     ThreeDGenerateSerializer,
+    ThreeDSnapshotUploadSerializer,
     ThreeDVersionSerializer,
 )
 
 from .services import (
     create_asset,
     create_job,
+    delete_message_block,
     delete_project_files,
     effective_floor_plan,
     effective_three_d,
@@ -68,6 +72,57 @@ def conversation_for(project, kind):
         kind=kind,
     )
     return conversation
+
+
+def failed_retry_message(conversation, retry_message_id, version_attribute):
+    """Lock and detach the failed attempt attached to a user message."""
+    message = get_object_or_404(
+        ConversationMessage.objects.select_for_update(),
+        id=retry_message_id,
+        conversation=conversation,
+        role=ConversationMessage.USER,
+    )
+    version = getattr(message, version_attribute, None)
+    job = version.job if version is not None else None
+    version_failed = version is not None and version.status == ProcessingJob.FAILED
+    job_failed = job is not None and job.status == ProcessingJob.FAILED
+    if not version_failed and not job_failed:
+        raise ValidationError(
+            {'retry_message_id': 'This message does not belong to a failed request.'}
+        )
+
+    version.delete()
+    if job is not None:
+        job.delete()
+    return message
+
+
+def failed_boq_retry_message(conversation, retry_message_id):
+    """Lock a failed BOQ turn and remove its failed versions and jobs."""
+    message = get_object_or_404(
+        ConversationMessage.objects.select_for_update(),
+        id=retry_message_id,
+        conversation=conversation,
+        role=ConversationMessage.USER,
+    )
+    versions = list(message.boq_versions.select_related('job'))
+    failed_versions = [
+        version
+        for version in versions
+        if version.status == ProcessingJob.FAILED
+        or (version.job is not None and version.job.status == ProcessingJob.FAILED)
+    ]
+    if not failed_versions or len(failed_versions) != len(versions):
+        raise ValidationError(
+            {'retry_message_id': 'This message does not belong to a failed request.'}
+        )
+
+    for version in failed_versions:
+        job = version.job
+        version.delete()
+        if job is not None:
+            job.delete()
+    return message
 
 
 def persist_floor_plan_selection(project, version):
@@ -288,6 +343,97 @@ class StepTwoInputUploadAPIView(APIView):
         )
 
 
+class FloorPlanAnalyzeAPIView(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request, project_id):
+        project = owned_project(request, project_id)
+        ensure_step_allowed(project, 2)
+        if not settings.AI_PIPELINE_ENABLED:
+            raise ValidationError(
+                {'ai_pipeline': 'AI pipeline is disabled on this backend.'}
+            )
+
+        serializer = FloorPlanAnalyzeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        version_id = serializer.validated_data.get('floor_plan_version_id')
+        if version_id:
+            floor_plan = get_object_or_404(
+                FloorPlanVersion,
+                id=version_id,
+                project=project,
+                status=ProcessingJob.COMPLETED,
+                image__isnull=False,
+            )
+        else:
+            floor_plan = effective_floor_plan(project)
+        if floor_plan is None:
+            raise ValidationError(
+                {'floor_plan': 'A completed 2D floor plan is required.'}
+            )
+
+        job = create_job(
+            project,
+            request.user,
+            ProcessingJob.FLOOR_PLAN_ANALYZE,
+            parameters={'floor_plan_version_id': str(floor_plan.id)},
+        )
+        enqueue_job(job)
+        return Response(
+            ProcessingJobSerializer(job).data,
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class ThreeDSnapshotUploadAPIView(APIView):
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, project_id):
+        project = owned_project(request, project_id)
+        ensure_step_allowed(project, 2)
+        serializer = ThreeDSnapshotUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        snapshot_file = serializer.validated_data['file']
+        validate_image_upload(snapshot_file)
+        floor_plan = get_object_or_404(
+            FloorPlanVersion,
+            id=serializer.validated_data['floor_plan_version_id'],
+            project=project,
+            status=ProcessingJob.COMPLETED,
+            image__isnull=False,
+        )
+        if settings.AI_PIPELINE_ENABLED:
+            floor_plan_metadata = floor_plan.image.metadata or {}
+            if not floor_plan_metadata.get('floorplan_json'):
+                raise ValidationError(
+                    {
+                        'floor_plan_version_id': (
+                            'Analyze this floor plan before uploading its WebGL snapshot.'
+                        )
+                    }
+                )
+
+        asset = create_asset(
+            project,
+            request.user,
+            snapshot_file,
+            ProjectAsset.THREE_D_SNAPSHOT,
+        )
+        asset.metadata = {
+            'source': 'frontend_three_webgl',
+            'floor_plan_version_id': str(floor_plan.id),
+            'rooms': serializer.validated_data['rooms'],
+        }
+        asset.save(update_fields=['metadata'])
+        return Response(
+            ProjectAssetSerializer(
+                asset,
+                context={'request': request},
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class FloorPlanGenerateAPIView(APIView):
     def post(self, request, project_id):
         project = owned_project(request, project_id)
@@ -314,14 +460,28 @@ class FloorPlanGenerateAPIView(APIView):
 
         conversation = conversation_for(project, Conversation.FLOOR_PLAN)
         with transaction.atomic():
-            message = ConversationMessage.objects.create(
-                conversation=conversation,
-                role=ConversationMessage.USER,
-                content=serializer.validated_data['prompt'],
-                metadata={
+            retry_message_id = serializer.validated_data.get('retry_message_id')
+            if retry_message_id:
+                message = failed_retry_message(
+                    conversation,
+                    retry_message_id,
+                    'floor_plan_version',
+                )
+                message.content = serializer.validated_data['prompt']
+                message.metadata = {
                     'parent_version_id': str(parent.id) if parent else None,
-                },
-            )
+                }
+                message.save(update_fields=['content', 'metadata'])
+            else:
+                message = ConversationMessage.objects.create(
+                    conversation=conversation,
+                    role=ConversationMessage.USER,
+                    content=serializer.validated_data['prompt'],
+                    metadata={
+                        'parent_version_id': str(parent.id) if parent else None,
+                    },
+                )
+            message.attachments.clear()
             if parent and parent.image_id:
                 message.attachments.add(parent.image)
             job = create_job(project, request.user, job_type)
@@ -464,8 +624,21 @@ class ThreeDGenerateAPIView(APIView):
         serializer = ThreeDGenerateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        original = None
+        original_id = serializer.validated_data.get('original_version_id')
+        if original_id:
+            original = get_object_or_404(
+                ThreeDVersion,
+                id=original_id,
+                project=project,
+                status=ProcessingJob.COMPLETED,
+                image__isnull=False,
+            )
+
         floor_plan_id = serializer.validated_data.get('floor_plan_version_id')
-        if floor_plan_id:
+        if original is not None:
+            floor_plan = original.floor_plan
+        elif floor_plan_id:
             floor_plan = get_object_or_404(
                 FloorPlanVersion,
                 id=floor_plan_id,
@@ -480,30 +653,127 @@ class ThreeDGenerateAPIView(APIView):
                 {'floor_plan': 'A completed 2D floor plan is required for Step 2.'}
             )
 
+        snapshot = None
+        style_references = []
+        if settings.AI_PIPELINE_ENABLED and original is None:
+            # A browser Three.js/WebGL snapshot is used when the client uploads
+            # one. Otherwise the worker renders the camera reference from the
+            # extracted geometry, analyzing the plan first if it has to.
+            snapshot_id = serializer.validated_data.get('snapshot_asset_id')
+            if snapshot_id:
+                snapshot = get_object_or_404(
+                    ProjectAsset,
+                    id=snapshot_id,
+                    project=project,
+                    kind=ProjectAsset.THREE_D_SNAPSHOT,
+                )
+                snapshot_floor_plan_id = (snapshot.metadata or {}).get(
+                    'floor_plan_version_id'
+                )
+                if snapshot_floor_plan_id != str(floor_plan.id):
+                    raise ValidationError(
+                        {
+                            'snapshot_asset_id': (
+                                'This snapshot was produced from a different '
+                                'floor plan.'
+                            )
+                        }
+                    )
+
+            reference_ids = serializer.validated_data['style_reference_asset_ids']
+            references_by_id = {
+                str(asset.id): asset
+                for asset in ProjectAsset.objects.filter(
+                    id__in=reference_ids,
+                    project=project,
+                    content_type__startswith='image/',
+                )
+            }
+            for reference_id in reference_ids:
+                reference = references_by_id.get(str(reference_id))
+                if reference is None:
+                    raise ValidationError(
+                        {
+                            'style_reference_asset_ids': (
+                                'Every style reference must be a project-owned image.'
+                            )
+                        }
+                    )
+                style_references.append(reference)
+
         if project.workflow == Project.COMPLETE and project.selected_floor_plan_id is None:
             persist_floor_plan_selection(project, floor_plan)
 
         conversation = conversation_for(project, Conversation.THREE_D)
         with transaction.atomic():
-            render_style = serializer.validated_data['render_style']
-            message = ConversationMessage.objects.create(
-                conversation=conversation,
-                role=ConversationMessage.USER,
-                content=serializer.validated_data['prompt'],
-                metadata={
-                    'floor_plan_version_id': str(floor_plan.id),
-                    'render_style': render_style,
+            render_style = (
+                original.render_style
+                if original is not None
+                else serializer.validated_data['render_style']
+            )
+            message_metadata = {
+                'floor_plan_version_id': str(floor_plan.id),
+                'render_style': render_style,
+                'snapshot_asset_id': str(snapshot.id) if snapshot else None,
+                'original_version_id': str(original.id) if original else None,
+                'style_reference_asset_ids': [
+                    str(asset.id) for asset in style_references
+                ],
+            }
+            retry_message_id = serializer.validated_data.get('retry_message_id')
+            if retry_message_id:
+                message = failed_retry_message(
+                    conversation,
+                    retry_message_id,
+                    'three_d_version',
+                )
+                message.content = serializer.validated_data['prompt']
+                message.metadata = message_metadata
+                message.save(update_fields=['content', 'metadata'])
+            else:
+                message = ConversationMessage.objects.create(
+                    conversation=conversation,
+                    role=ConversationMessage.USER,
+                    content=serializer.validated_data['prompt'],
+                    metadata=message_metadata,
+                )
+            message.attachments.clear()
+            message.attachments.add(floor_plan.image)
+            if snapshot:
+                message.attachments.add(snapshot)
+            if style_references:
+                message.attachments.add(*style_references)
+            job_type = (
+                ProcessingJob.THREE_D_EDIT
+                if original is not None
+                else ProcessingJob.THREE_D_GENERATE
+            )
+            job = create_job(
+                project,
+                request.user,
+                job_type,
+                parameters={
+                    'snapshot_asset_id': str(snapshot.id) if snapshot else None,
+                    'style_reference_asset_ids': [
+                        str(asset.id) for asset in style_references
+                    ],
                 },
             )
-            message.attachments.add(floor_plan.image)
-            job = create_job(project, request.user, ProcessingJob.THREE_D_GENERATE)
             version = ThreeDVersion.objects.create(
                 project=project,
                 created_by=request.user,
-                source=ThreeDVersion.GENERATED,
+                source=(
+                    ThreeDVersion.EDITED
+                    if original is not None
+                    else ThreeDVersion.GENERATED
+                ),
                 render_style=render_style,
                 prompt_message=message,
                 floor_plan=floor_plan,
+                parent=original,
+                instruction=(
+                    serializer.validated_data['prompt'] if original else ''
+                ),
                 job=job,
             )
 
@@ -701,6 +971,16 @@ class BOQGenerateAPIView(APIView):
         serializer = BOQGenerateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        active_version = project.boq_versions.select_related('job').filter(
+            status__in=[ProcessingJob.QUEUED, ProcessingJob.PROCESSING],
+            job__status__in=[ProcessingJob.QUEUED, ProcessingJob.PROCESSING],
+        ).first()
+        if active_version is not None:
+            return Response(
+                BOQVersionSerializer(active_version).data,
+                status=status.HTTP_202_ACCEPTED,
+            )
+
         if project.workflow == Project.COMPLETE:
             three_d = effective_three_d(project)
             if three_d is None:
@@ -715,19 +995,30 @@ class BOQGenerateAPIView(APIView):
             document_ids = list(
                 project.documents.values_list('id', flat=True)
             )
-            message = ConversationMessage.objects.create(
-                conversation=conversation,
-                role=ConversationMessage.USER,
-                content=serializer.validated_data['prompt'],
-                metadata={
-                    'document_ids': [str(document_id) for document_id in document_ids],
-                    'three_d_version_id': (
-                        str(project.selected_three_d_id)
-                        if project.selected_three_d_id
-                        else None
-                    ),
-                },
-            )
+            message_metadata = {
+                'document_ids': [str(document_id) for document_id in document_ids],
+                'three_d_version_id': (
+                    str(project.selected_three_d_id)
+                    if project.selected_three_d_id
+                    else None
+                ),
+            }
+            retry_message_id = serializer.validated_data.get('retry_message_id')
+            if retry_message_id:
+                message = failed_boq_retry_message(
+                    conversation,
+                    retry_message_id,
+                )
+                message.content = serializer.validated_data['prompt']
+                message.metadata = message_metadata
+                message.save(update_fields=['content', 'metadata'])
+            else:
+                message = ConversationMessage.objects.create(
+                    conversation=conversation,
+                    role=ConversationMessage.USER,
+                    content=serializer.validated_data['prompt'],
+                    metadata=message_metadata,
+                )
 
             job = create_job(project, request.user, ProcessingJob.BOQ_GENERATE)
             version = BOQVersion.objects.create(
@@ -800,6 +1091,10 @@ class BOQSelectAPIView(APIView):
             project=project,
             status=ProcessingJob.COMPLETED,
         )
+        if (version.structured_data or {}).get('workflow_pending'):
+            raise ValidationError(
+                {'version': 'Complete and finalize the BOQ workflow before approval.'}
+            )
         project.selected_boq = version
         project.step_3_completed_at = timezone.now()
         project.boq_skipped_at = None
@@ -844,8 +1139,15 @@ class ConversationMessageDeleteAPIView(APIView):
             id=message_id,
             conversation__project=project,
         )
-        message.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        delete_message_block(message)
+        return Response(
+            {
+                'success': True,
+                'message': 'Message block deleted successfully',
+                'deleted_message_id': str(message_id),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class ProjectDocumentListCreateAPIView(APIView):

@@ -103,6 +103,7 @@ class Project(models.Model):
 class ProjectAsset(models.Model):
     FLOOR_PLAN = 'FLOOR_PLAN'
     THREE_D_IMAGE = 'THREE_D_IMAGE'
+    THREE_D_SNAPSHOT = 'THREE_D_SNAPSHOT'
     MASK = 'MASK'
     BOQ_FILE = 'BOQ_FILE'
     DOCUMENT = 'DOCUMENT'
@@ -112,6 +113,7 @@ class ProjectAsset(models.Model):
     KIND_CHOICES = [
         (FLOOR_PLAN, '2D floor plan'),
         (THREE_D_IMAGE, '3D image'),
+        (THREE_D_SNAPSHOT, 'Frontend WebGL snapshot'),
         (MASK, '3D edit mask'),
         (BOQ_FILE, 'BOQ file'),
         (DOCUMENT, 'Project document'),
@@ -161,6 +163,7 @@ class ProcessingJob(models.Model):
 
     FLOOR_PLAN_GENERATE = 'FLOOR_PLAN_GENERATE'
     FLOOR_PLAN_EDIT = 'FLOOR_PLAN_EDIT'
+    FLOOR_PLAN_ANALYZE = 'FLOOR_PLAN_ANALYZE'
     THREE_D_GENERATE = 'THREE_D_GENERATE'
     THREE_D_EDIT = 'THREE_D_EDIT'
     THREE_D_ANGLE = 'THREE_D_ANGLE'
@@ -170,6 +173,7 @@ class ProcessingJob(models.Model):
     JOB_TYPE_CHOICES = [
         (FLOOR_PLAN_GENERATE, 'Generate 2D floor plan'),
         (FLOOR_PLAN_EDIT, 'Edit 2D floor plan'),
+        (FLOOR_PLAN_ANALYZE, 'Extract floor-plan geometry'),
         (THREE_D_GENERATE, 'Generate 3D image'),
         (THREE_D_EDIT, 'Edit 3D image'),
         (THREE_D_ANGLE, 'Generate 3D viewing angle'),
@@ -411,9 +415,12 @@ class ThreeDVersion(models.Model):
         null=True,
         blank=True,
     )
+    # SET_NULL, not PROTECT: the only thing that deletes a FloorPlanVersion is
+    # its project cascading, and PROTECT here made deleting any project that had
+    # reached Step 2 impossible.
     floor_plan = models.ForeignKey(
         FloorPlanVersion,
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
         related_name='three_d_versions',
         null=True,
         blank=True,
@@ -529,8 +536,13 @@ class ProjectDocument(models.Model):
     ESTIMATION = 'ESTIMATION'
     MATERIAL_SPECIFICATION = 'MATERIAL_SPECIFICATION'
     THREE_D_MODEL = 'THREE_D_MODEL'
+    MEP_DRAWING = 'MEP_DRAWING'
+    HVAC_DRAWING = 'HVAC_DRAWING'
+    DOOR_WINDOW_SCHEDULE = 'DOOR_WINDOW_SCHEDULE'
     OTHER = 'OTHER'
 
+    # Display labels are matched verbatim by the BOQ agent prompt's "Type:"
+    # detection (app/ai/boq/main_agent.py, section 0.1) — do not reword them.
     DOCUMENT_TYPE_CHOICES = [
         (GENERAL, 'General document'),
         (PROJECT_BRIEF, 'Project brief'),
@@ -538,6 +550,9 @@ class ProjectDocument(models.Model):
         (ESTIMATION, 'Estimation'),
         (MATERIAL_SPECIFICATION, 'Material specification'),
         (THREE_D_MODEL, '3D model'),
+        (MEP_DRAWING, 'MEP Drawing'),
+        (HVAC_DRAWING, 'HVAC Drawing'),
+        (DOOR_WINDOW_SCHEDULE, 'Door & Window Schedule'),
         (OTHER, 'Other'),
     ]
 

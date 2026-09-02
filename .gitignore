@@ -8,4 +8,9 @@ venv/
 .coverage
 staticfiles/
 .agents/
+generated_outputs/
+media/
 .agents/
+.codex/
+.env.docker
+kraiosv1-a6a7ac6ae001.json

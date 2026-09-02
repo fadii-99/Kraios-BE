@@ -1,20 +1,4 @@
 services:
-  db:
-    image: postgres:18-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -32,17 +16,18 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      TMPDIR: /app/ai_state
     command: >
       sh -c "python manage.py migrate &&
              python manage.py collectstatic --noinput &&
              daphne -b 0.0.0.0 -p 8000 config.asgi:application"
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
       - media_data:/app/media
+      - ai_state:/app/ai_state
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -63,16 +48,17 @@ services:
       replicas: 2
     env_file:
       - .env
+    environment:
+      TMPDIR: /app/ai_state
     command: celery -A config worker --loglevel=info --concurrency=2
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
       - media_data:/app/media
+      - ai_state:/app/ai_state
 
 volumes:
-  postgres_data:
   redis_data:
   media_data:
+  ai_state:

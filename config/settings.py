@@ -2,8 +2,15 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Docker containers get their env from `env_file:`, so this is a no-op there.
+# Locally (runserver/celery run outside Docker), this loads .env into the
+# process so both read the same config without exporting vars by hand.
+load_dotenv(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
@@ -115,13 +122,13 @@ if postgres_database:
             'CONN_MAX_AGE': 60,
         }
     }
-else:
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
-        }
-    }
+# else:
+#     DATABASES = {
+#         'default': {
+#             'ENGINE': 'django.db.backends.sqlite3',
+#             'NAME': BASE_DIR / 'db.sqlite3',
+#         }
+#     }
 
 
 # Password validation
@@ -249,6 +256,9 @@ PROJECT_UPLOAD_MAX_BYTES = int(
 )
 AI_PLACEHOLDER_DELAY_SECONDS = int(
     os.environ.get('AI_PLACEHOLDER_DELAY_SECONDS', '5')
+)
+AI_PIPELINE_ENABLED = (
+    os.environ.get('AI_PIPELINE_ENABLED', 'False').lower() == 'true'
 )
 
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://redis:6379/0')
