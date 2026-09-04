@@ -70,6 +70,10 @@ INSTALLED_APPS = [
     'accounts',
     'profiles',
     'projects',
+    # The admin console API. Its package is `admin`, but its app LABEL is
+    # `kraios_admin` because `django.contrib.admin` already owns the label
+    # `admin` and two apps may not share one. See admin/apps.py.
+    'admin.apps.KraiosAdminConfig',
 ]
 
 MIDDLEWARE = [
@@ -204,6 +208,20 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'profile_otp': '5/hour',
         'password_reset': '10/hour',
+        # Keyed on (email, client IP) - see admin/throttles.py. Generous enough
+        # for somebody mistyping a password, useless for guessing one.
+        'admin_login': '30/hour',
+        # A ceiling on all admin traffic from one signed-in administrator, so a
+        # looping console page cannot become everyone else's load problem.
+        'admin_api': '1200/hour',
+        # The signup calendar, keyed on the client IP - see accounts/throttles.py.
+        # Paging through months and picking a date costs a handful of requests;
+        # this is only a ceiling on scraping the schedule.
+        'public_booking': '240/hour',
+        # The public contact form, keyed on the client IP - see
+        # admin/throttles.py. A write anybody can reach, so this is a spam
+        # ceiling: one genuine enquiry, and room to think of a second.
+        'public_contact': '10/hour',
     },
 }
 
@@ -221,6 +239,78 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,
     'CHECK_REVOKE_TOKEN': True,
 }
+
+# ---------------------------------------------------------------------------
+# KRAIOS admin console
+# ---------------------------------------------------------------------------
+#
+# The console is a separate browser application with a separate credential. Its
+# cookies are named differently from the customer ones on purpose: a customer
+# session is never presented to an admin endpoint, so it cannot be replayed
+# there even when both applications share a hostname. The tokens additionally
+# carry an admin scope claim, which the customer login endpoint cannot mint.
+
+ADMIN_AUTH_ACCESS_COOKIE_NAME = (
+    'kraios_admin_access' if DEBUG else '__Host-kraios_admin_access'
+)
+ADMIN_AUTH_REFRESH_COOKIE_NAME = (
+    'kraios_admin_refresh' if DEBUG else '__Host-kraios_admin_refresh'
+)
+ADMIN_AUTH_COOKIE_SECURE = not DEBUG
+
+# 'Lax' is correct while the console and the API share a registrable domain
+# (localhost:5174 -> localhost:8000 in development, admin.example.com ->
+# api.example.com in production). Set this to 'None' ONLY if they are on
+# genuinely different sites, and only together with HTTPS - a system check
+# refuses that combination without secure cookies.
+ADMIN_AUTH_COOKIE_SAMESITE = os.environ.get(
+    'DJANGO_ADMIN_COOKIE_SAMESITE',
+    AUTH_COOKIE_SAMESITE,
+)
+
+# Deliberately shorter than the customer session: this credential can
+# deactivate accounts and issue passwords.
+ADMIN_ACCESS_TOKEN_LIFETIME = timedelta(
+    minutes=int(os.environ.get('ADMIN_ACCESS_TOKEN_MINUTES', '15'))
+)
+ADMIN_REFRESH_TOKEN_LIFETIME = timedelta(
+    hours=int(os.environ.get('ADMIN_REFRESH_TOKEN_HOURS', '8'))
+)
+
+# Where the placeholder store for plans, per-user subscriptions and support
+# lives. NOT a database - see admin/dummy_data.py. Deleting this file resets
+# that data and touches nothing else.
+KRAIOS_ADMIN_DUMMY_STORE_PATH = Path(
+    os.environ.get(
+        'KRAIOS_ADMIN_DUMMY_STORE_PATH',
+        BASE_DIR / 'ai_state' / 'admin_placeholder_store.json',
+    )
+)
+
+# Meeting reminders. The lead time is what the customer is promised; the grace
+# is how far past it the task will still deliver, so a worker that was down for
+# a few minutes does not silently drop a reminder.
+KRAIOS_ADMIN_REMINDER_LEAD_MINUTES = int(
+    os.environ.get('KRAIOS_ADMIN_REMINDER_LEAD_MINUTES', '60')
+)
+KRAIOS_ADMIN_REMINDER_GRACE_MINUTES = int(
+    os.environ.get('KRAIOS_ADMIN_REMINDER_GRACE_MINUTES', '10')
+)
+
+# Who is alerted about an upcoming call. Empty means "every active
+# administrator", which is the right default for a small team.
+KRAIOS_ADMIN_ALERT_EMAILS = [
+    address.strip()
+    for address in os.environ.get('KRAIOS_ADMIN_ALERT_EMAILS', '').split(',')
+    if address.strip()
+]
+
+# Printed in the credentials email an administrator issues, so it has to point
+# at the CUSTOMER application, not the console.
+KRAIOS_APP_SIGN_IN_URL = os.environ.get(
+    'KRAIOS_APP_SIGN_IN_URL',
+    'http://localhost:5173/login',
+)
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 SECURE_SSL_REDIRECT = (
@@ -288,6 +378,20 @@ CELERY_TASK_SOFT_TIME_LIMIT = int(
 CELERY_TASK_ALWAYS_EAGER = (
     os.environ.get('CELERY_TASK_ALWAYS_EAGER', 'False').lower() == 'true'
 )
+
+# Periodic work. Run with `celery -A config beat`; compose.yaml has a service
+# for it. The reminder interval has to be well under
+# KRAIOS_ADMIN_REMINDER_GRACE_MINUTES or a reminder can fall between two runs.
+CELERY_BEAT_SCHEDULE = {
+    'kraios-admin-meeting-reminders': {
+        'task': 'admin.tasks.send_due_meeting_reminders',
+        'schedule': 300.0,
+    },
+    'kraios-admin-prune-login-attempts': {
+        'task': 'admin.tasks.prune_login_attempts',
+        'schedule': 3600.0,
+    },
+}
 
 CHANNEL_LAYERS = {
     'default': {

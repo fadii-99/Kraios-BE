@@ -14,3 +14,7 @@ media/
 .codex/
 .env.docker
 kraiosv1-a6a7ac6ae001.json
+
+# Runtime state, including the admin console's placeholder store for plans,
+# subscriptions and support (admin/dummy_data.py). Not source, not a database.
+ai_state/

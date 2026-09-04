@@ -28,4 +28,16 @@ urlpatterns = [
     path('api/v1/auth/', include('accounts.urls')),
     path('api/v1/profile/', include('profiles.urls')),
     path('api/v1/projects/', include('projects.urls')),
+    # The admin console API. Mounted under /api/v1/admin/ because Django's own
+    # admin site already owns the bare /admin/ prefix above; the string form of
+    # include() is used so the local name `admin` (django.contrib.admin) is not
+    # shadowed by the app package of the same name.
+    path('api/v1/admin/', include('admin.urls')),
+    # The public contact form writes into the console's support queue. Kept
+    # off the /admin/ prefix on purpose - see admin/public_urls.py.
+    path('api/v1/support/', include('admin.public_urls')),
+    # What a signed-in CUSTOMER may read of the plan catalogue and of their own
+    # subscription - the console's records, a different reader, a different
+    # field set. See admin/customer_urls.py.
+    path('api/v1/billing/', include('admin.customer_urls')),
 ]

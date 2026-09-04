@@ -1,0 +1,8 @@
+Hello {{ full_name }},
+
+Your {{ plan }} plan is now active on your Kraios account.
+
+Active for: {{ duration_days }} days
+Renews on:  {{ renewal_date }}
+
+Kraios Team

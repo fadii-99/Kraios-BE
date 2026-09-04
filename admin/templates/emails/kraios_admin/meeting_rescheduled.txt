@@ -1,0 +1,9 @@
+Hello {{ full_name }},
+
+Your Kraios walkthrough has been moved.
+
+New date and time: {{ scheduled_at|date:"F j, Y" }} at {{ scheduled_at|time:"H:i" }} UTC
+
+If that does not suit you, reply to this email and we will find another slot.
+
+Kraios Team

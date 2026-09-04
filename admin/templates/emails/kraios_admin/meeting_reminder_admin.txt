@@ -1,0 +1,8 @@
+An onboarding call starts in about {{ minutes_before }} minutes.
+
+Attendee: {{ full_name }}
+Firm:     {{ firm_name }}
+Email:    {{ email }}
+When:     {{ scheduled_at|date:"F j, Y" }} at {{ scheduled_at|time:"H:i" }} UTC
+
+Kraios Admin

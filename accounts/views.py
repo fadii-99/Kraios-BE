@@ -1,10 +1,14 @@
 import logging
 import uuid
+from datetime import date as date_type
+from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth import authenticate
+from django.contrib.auth.models import update_last_login
 from django.db import transaction
 from django.middleware.csrf import get_token
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
 from rest_framework import status
@@ -33,6 +37,20 @@ from profiles.services import (
     create_account_verification,
 )
 from profiles.throttles import PasswordResetThrottle
+
+# The booking calendar is owned by the admin app - it is the administrator's
+# schedule - and read here rather than reimplemented, so the public form and
+# the console can never offer different weeks. Safe at module scope: nothing
+# under `admin.services_meetings` imports `accounts.views` back.
+from admin.services_meetings import (
+    MAX_SLOT_HORIZON_DAYS,
+    available_slots,
+    format_slot_label,
+    open_days,
+    parse_slot_label,
+)
+
+from .throttles import PublicBookingThrottle
 
 
 logger = logging.getLogger(__name__)
@@ -107,6 +125,130 @@ class SignupRequestAPIView(APIView):
             'confirmation_email_sent': email_sent,
         }
         return Response(response_data, status=status.HTTP_201_CREATED)
+
+
+# ---------------------------------------------------------------------------
+# Public booking calendar
+# ---------------------------------------------------------------------------
+#
+# The signup form draws its calendar and its slot list from these two, so the
+# dates and times a visitor can pick are exactly the ones an administrator left
+# open in the console. They are the PUBLIC read side of
+# ``admin.services_meetings``; the console keeps its own authenticated
+# ``meetings/slots/`` because it needs the same answer while impersonating
+# nobody, and both call the same service so the two can never disagree.
+#
+# Unauthenticated by necessity - the visitor has no account yet, which is the
+# whole point of the form - so they are GET-only, read-only, throttled by IP,
+# and expose nothing but times: no meeting, no name, no email.
+
+
+def _booking_horizon():
+    """``(today, last bookable date)`` in UTC, the range both views clamp to."""
+    today = timezone.now().date()
+    return today, today + timedelta(days=MAX_SLOT_HORIZON_DAYS)
+
+
+class BookingDaysAPIView(APIView):
+    """
+    The dates in one month that still have a free slot.
+
+    A month at a time rather than the whole horizon: the calendar renders one
+    month, and shipping four months of dates to grey out one would be three
+    months of answer nobody reads.
+
+    Returns only the OPEN dates. The absent ones are closed, and a caller
+    cannot tell a closed weekday from a blackout from a fully booked day -
+    which is correct, because none of those are a visitor's business and all
+    three mean the same thing to them.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [PublicBookingThrottle]
+
+    def get(self, request):
+        today, horizon = _booking_horizon()
+
+        raw_month = (request.query_params.get('month') or '').strip()
+        if raw_month:
+            try:
+                first = date_type.fromisoformat(f'{raw_month}-01')
+            except ValueError:
+                return Response(
+                    {'detail': 'Ask for a month as YYYY-MM.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            first = today.replace(day=1)
+
+        # The last day of `first`'s month, without a calendar library: step into
+        # the next month and back off one day.
+        next_month = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+        last = next_month - timedelta(days=1)
+
+        # Nothing before today and nothing past the horizon is bookable, so the
+        # window is clipped rather than queried and thrown away.
+        start = max(first, today)
+        end = min(last, horizon)
+
+        days = open_days(start, end) if start <= end else []
+
+        return Response({
+            'month': first.strftime('%Y-%m'),
+            'min_date': today.isoformat(),
+            'max_date': horizon.isoformat(),
+            'days': [day.isoformat() for day in days],
+        })
+
+
+class BookingSlotsAPIView(APIView):
+    """
+    The slots on one date, as the signup form lists them.
+
+    Taken and already-passed slots are returned with ``available: false``
+    rather than dropped, so the form can show them struck through - the same
+    thing the console does, and the reason a visitor can see that 10:00 exists
+    and is gone instead of wondering why the day starts at 10:30.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [PublicBookingThrottle]
+
+    def get(self, request):
+        raw_date = (request.query_params.get('date') or '').strip()
+        if not raw_date:
+            return Response(
+                {'detail': 'Name the date to look at.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            target = date_type.fromisoformat(raw_date)
+        except ValueError:
+            return Response(
+                {'detail': 'Ask for a date as YYYY-MM-DD.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        today, horizon = _booking_horizon()
+        if target < today or target > horizon:
+            # Not an error the form can produce, and not worth a distinct
+            # message: a date outside the window has no slots, which is what an
+            # empty list already says.
+            return Response({'date': target.isoformat(), 'slots': []})
+
+        slots = [
+            {
+                'time': slot['time'],
+                'label': format_slot_label(parse_slot_label(slot['time'])),
+                'available': slot['available'],
+            }
+            for slot in available_slots(target)
+        ]
+
+        return Response({'date': target.isoformat(), 'slots': slots})
 
 
 class ForgotPasswordRequestAPIView(APIView):
@@ -204,7 +346,6 @@ class LoginAPIView(APIView):
 
     def post(self, request):
         enforce_csrf(request)
-        from django.contrib.auth.hashers import make_password
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         email = serializer.validated_data['email']
@@ -212,9 +353,6 @@ class LoginAPIView(APIView):
 
         try:
             user = User.objects.get(email=email)
-            # user.password = make_password("123456789")
-            # user.is_active = True
-            # user.save()
         except User.DoesNotExist:
             return Response(
                 {'detail': 'Invalid email or password.'},
@@ -245,6 +383,11 @@ class LoginAPIView(APIView):
                 {'detail': 'Invalid email or password.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
+
+        # Recorded here because `authenticate()` does not fire the signal that
+        # normally maintains it, and the admin console reports "last active"
+        # from this column.
+        update_last_login(None, authenticated_user)
 
         refresh_token = RefreshToken.for_user(authenticated_user)
         profile_serializer = UserProfileSerializer(authenticated_user)

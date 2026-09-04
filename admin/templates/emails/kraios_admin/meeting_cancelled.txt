@@ -1,0 +1,7 @@
+Hello {{ full_name }},
+
+Your Kraios walkthrough has been cancelled.
+
+Reply to this email whenever you would like to rebook and we will find you a new slot.
+
+Kraios Team

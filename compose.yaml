@@ -58,6 +58,24 @@ services:
       - media_data:/app/media
       - ai_state:/app/ai_state
 
+  # Celery beat. Without it nothing enqueues the meeting reminders, so the
+  # customer is never told their walkthrough is about to start. One replica
+  # only: two schedulers would enqueue every periodic task twice.
+  beat:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TMPDIR: /app/ai_state
+    command: celery -A config beat --loglevel=info
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+      - ai_state:/app/ai_state
+
 volumes:
   redis_data:
   media_data:

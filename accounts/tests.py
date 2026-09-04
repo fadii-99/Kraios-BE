@@ -1,13 +1,21 @@
 import re
+from datetime import date as date_type
+from datetime import datetime, time, timedelta
+from datetime import timezone as datetime_timezone
 
 from django.core import mail
 from django.urls import reverse
 from django.conf import settings
 from django.test import TestCase
+from django.utils import timezone
+from django.utils.formats import date_format
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
+
+from admin.models import AvailabilityBlackout, Meeting
+from admin.services_meetings import open_days
 
 from .emails import (
     FORGOT_PASSWORD_OTP_TEMPLATE_ID,
@@ -16,15 +24,39 @@ from .emails import (
 from .models import SignupRequest, User
 
 
+def _next_weekday(start, weekday):
+    """The first date on or after ``start`` that falls on ``weekday``."""
+    return start + timedelta(days=(weekday - start.weekday()) % 7)
+
+
+def _next_open_day():
+    """
+    The soonest date the seeded schedule actually offers, from tomorrow on.
+
+    Asked of the schedule rather than assumed, so these tests keep booking a
+    real slot if the seeded week ever changes - and fail loudly, on this line,
+    if it is ever emptied.
+    """
+    start = timezone.now().date() + timedelta(days=1)
+    days = open_days(start, start + timedelta(days=14))
+    assert days, 'No bookable date in the next fortnight - is the week seeded?'
+    return days[0]
+
+
 class SignupRequestAPITests(APITestCase):
     def setUp(self):
         self.url = reverse('accounts:signup-request')
+        # A real slot out of the seeded Mon-Fri 09:00-17:00 week, computed
+        # rather than written down. A fixed date would book nothing the moment
+        # it fell into the past, and a date reached by plain arithmetic lands on
+        # a closed weekend two runs in seven.
+        self.booking_date = _next_open_day()
         self.payload = {
             'name': 'Ayesha Khan',
             'firm': 'Khan Architecture',
             'email': 'Ayesha@Example.com',
             'country': 'Pakistan',
-            'date': '2026-09-15',
+            'date': self.booking_date.isoformat(),
             'time': '10:00 AM - 11:00 AM',
         }
 
@@ -50,7 +82,7 @@ class SignupRequestAPITests(APITestCase):
             mail.outbox[0].extra_headers['X-Kraios-Template-ID'],
             SIGNUP_MEETING_CONFIRMATION_TEMPLATE_ID,
         )
-        self.assertIn('September 15, 2026', mail.outbox[0].body)
+        self.assertIn(date_format(self.booking_date, 'F j, Y'), mail.outbox[0].body)
         self.assertIn(self.payload['time'], mail.outbox[0].body)
         self.assertEqual(mail.outbox[0].to, ['ayesha@example.com'])
 
@@ -74,6 +106,161 @@ class SignupRequestAPITests(APITestCase):
             set(response.data.keys()),
             {'name', 'firm', 'email', 'country', 'date', 'time'},
         )
+
+
+class PublicBookingCalendarTests(APITestCase):
+    """
+    What the signup form is allowed to offer, and what it is allowed to book.
+
+    The point of these is the JOIN: the two read endpoints and the signup
+    endpoint have to agree, because a date the calendar offers and the
+    serializer then refuses is a visitor filling in a form that cannot succeed.
+    Each test therefore closes something in the admin's schedule and asserts on
+    both sides of it.
+    """
+
+    def setUp(self):
+        self.days_url = reverse('accounts:booking-days')
+        self.slots_url = reverse('accounts:booking-slots')
+        self.signup_url = reverse('accounts:signup-request')
+        self.open_day = _next_open_day()
+
+    def _signup(self, **overrides):
+        payload = {
+            'name': 'Ayesha Khan',
+            'firm': 'Khan Architecture',
+            'email': 'ayesha@example.com',
+            'country': 'Pakistan',
+            'date': self.open_day.isoformat(),
+            'time': '10:00 AM',
+        }
+        payload.update(overrides)
+        return self.client.post(self.signup_url, payload, format='json')
+
+    def test_days_lists_open_dates_and_omits_the_closed_ones(self):
+        response = self.client.get(
+            self.days_url, {'month': self.open_day.strftime('%Y-%m')}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        days = response.data['days']
+
+        self.assertIn(self.open_day.isoformat(), days)
+        # The seeded week is Monday-Friday, so nothing in the answer is a
+        # weekend - asserted over the whole list rather than on one date,
+        # because one closed date could be a blackout instead of the rule.
+        for day in days:
+            self.assertLess(date_type.fromisoformat(day).weekday(), 5)
+
+    def test_days_never_offers_yesterday(self):
+        today = timezone.now().date()
+
+        response = self.client.get(self.days_url, {'month': today.strftime('%Y-%m')})
+
+        self.assertEqual(response.data['min_date'], today.isoformat())
+        for day in response.data['days']:
+            self.assertGreaterEqual(date_type.fromisoformat(day), today)
+
+    def test_a_blacked_out_date_leaves_the_calendar_and_the_form_together(self):
+        AvailabilityBlackout.objects.create(date=self.open_day, reason='Offsite')
+
+        days = self.client.get(
+            self.days_url, {'month': self.open_day.strftime('%Y-%m')}
+        )
+        slots = self.client.get(self.slots_url, {'date': self.open_day.isoformat()})
+        booking = self._signup()
+
+        self.assertNotIn(self.open_day.isoformat(), days.data['days'])
+        self.assertEqual(slots.data['slots'], [])
+        self.assertEqual(booking.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('time', booking.data)
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_slots_carry_the_label_the_form_submits_back(self):
+        response = self.client.get(self.slots_url, {'date': self.open_day.isoformat()})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        by_time = {slot['time']: slot for slot in response.data['slots']}
+
+        self.assertEqual(by_time['09:00']['label'], '09:00 AM')
+        self.assertEqual(by_time['14:30']['label'], '02:30 PM')
+        self.assertTrue(by_time['14:30']['available'])
+
+        # The label is the round trip: what the endpoint shows is what the form
+        # sends, and the serializer has to accept it back.
+        self.assertEqual(
+            self._signup(time=by_time['14:30']['label']).status_code,
+            status.HTTP_201_CREATED,
+        )
+
+    def test_a_taken_slot_is_shown_as_taken_and_cannot_be_booked_twice(self):
+        holder = User.objects.create_user(
+            email='holder@example.com',
+            password=None,
+            full_name='Holder',
+            is_active=False,
+        )
+        Meeting.objects.create(
+            user=holder,
+            scheduled_at=datetime.combine(
+                self.open_day, time(10, 0), tzinfo=datetime_timezone.utc
+            ),
+            status=Meeting.SCHEDULED,
+        )
+
+        slots = self.client.get(self.slots_url, {'date': self.open_day.isoformat()})
+        by_time = {slot['time']: slot for slot in slots.data['slots']}
+
+        # Reported as taken rather than dropped - the form strikes it through,
+        # so "10:00 is gone" does not read as "the day starts at 10:30".
+        self.assertIn('10:00', by_time)
+        self.assertFalse(by_time['10:00']['available'])
+
+        self.assertEqual(self._signup().status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Meeting.objects.count(), 1)
+
+    def test_a_closed_weekday_cannot_be_booked(self):
+        saturday = _next_weekday(self.open_day, weekday=5)
+
+        response = self._signup(date=saturday.isoformat())
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('time', response.data)
+        self.assertEqual(SignupRequest.objects.count(), 0)
+
+    def test_a_time_between_slots_cannot_be_booked(self):
+        # 09:07 sits inside the open window but on no half-hour boundary. The
+        # window is not the offer; the grid the window generates is.
+        response = self._signup(time='09:07 AM')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_a_date_in_the_past_cannot_be_booked(self):
+        yesterday = timezone.now().date() - timedelta(days=1)
+
+        response = self._signup(date=yesterday.isoformat())
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_the_booking_endpoints_need_no_session(self):
+        # Public by necessity: the visitor has no account yet. Asserted so a
+        # later default-permission change cannot quietly close the signup form.
+        self.assertEqual(
+            self.client.get(self.days_url).status_code, status.HTTP_200_OK
+        )
+        self.assertEqual(
+            self.client.get(
+                self.slots_url, {'date': self.open_day.isoformat()}
+            ).status_code,
+            status.HTTP_200_OK,
+        )
+
+    def test_a_malformed_month_is_refused_rather_than_guessed(self):
+        response = self.client.get(self.days_url, {'month': 'next-tuesday'})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
 class ForgotPasswordAPITests(APITestCase):

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#172033">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+      <tr>
+        <td align="center" style="padding:32px 16px">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#ffffff;border-radius:12px">
+            <tr>
+              <td style="padding:32px">
+                <h1 style="margin:0 0 20px;font-size:24px">Onboarding call in {{ minutes_before }} minutes</h1>
+                <p><strong>Attendee:</strong> {{ full_name }}<br>
+                   <strong>Firm:</strong> {{ firm_name }}<br>
+                   <strong>Email:</strong> {{ email }}<br>
+                   <strong>When:</strong> {{ scheduled_at|date:"F j, Y" }} at {{ scheduled_at|time:"H:i" }} UTC</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+Hello {{ full_name }},
+
+This is a reminder that your Kraios walkthrough starts in about {{ minutes_before }} minutes.
+
+Scheduled for: {{ scheduled_at|date:"F j, Y" }} at {{ scheduled_at|time:"H:i" }} UTC
+
+If you can no longer attend, reply to this email and we will rebook you.
+
+Kraios Team

@@ -42,8 +42,17 @@ EMAIL_TEMPLATES = {
 }
 
 
-def send_templated_email(template_id, recipient, context):
-    template = EMAIL_TEMPLATES[template_id]
+def send_templated_email(template_id, recipient, context, templates=None):
+    """
+    Render and send one templated email.
+
+    ``templates`` lets another app supply its own registry of
+    ``EmailTemplateDefinition`` entries while still going through this one
+    sending path, so there is a single place that sets the from-address, the
+    template-id header and the text/HTML alternative pair. The admin console
+    uses it; see ``admin/emails.py``.
+    """
+    template = (templates or EMAIL_TEMPLATES)[template_id]
     complete_context = {
         **context,
         'app_name': 'Kraios',
