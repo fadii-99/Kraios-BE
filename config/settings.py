@@ -74,6 +74,9 @@ INSTALLED_APPS = [
     # `kraios_admin` because `django.contrib.admin` already owns the label
     # `admin` and two apps may not share one. See admin/apps.py.
     'admin.apps.KraiosAdminConfig',
+    # The BIM engine. Fully self-contained - see bim/README.md for how to
+    # remove it: this line, one line in config/urls.py, and the directory.
+    'bim',
 ]
 
 MIDDLEWARE = [

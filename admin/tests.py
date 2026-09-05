@@ -13,7 +13,7 @@ read or overwrite the real placeholder store.
 """
 import shutil
 import tempfile
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 from django.conf import settings
@@ -358,22 +358,36 @@ class AdminUserManagementTests(AdminTestCase):
         self.assertEqual(subscription['durationDays'], 30)
         self.assertEqual(subscription['status'], 'Active')
 
-    def test_a_custom_activation_period_is_honoured(self):
-        response = self.client.post(
+    def test_the_billing_cycle_is_also_the_term(self):
+        # One choice decides both the price and the end date. Annual is 365
+        # days at the annual rate; there is no separate term to disagree with
+        # it, which is what used to put "PS1,928/yr" on an account whose access
+        # ended in a month.
+        annual = self.client.post(
             reverse('kraios_admin:user-subscription', args=[self.customer.pk]),
-            {'planId': 'plan-studio', 'billingCycle': 'Monthly', 'durationDays': 45},
+            {'planId': 'plan-studio', 'billingCycle': 'Annual'},
             format='json',
         )
 
-        self.assertEqual(response.data['subscriptionDetail']['durationDays'], 45)
+        detail = annual.data['subscriptionDetail']
+        self.assertEqual(detail['durationDays'], 365)
+        self.assertEqual(
+            date.fromisoformat(detail['renewalDate'])
+            - date.fromisoformat(detail['startDate']),
+            timedelta(days=365),
+        )
 
-    def test_an_absurd_activation_period_is_refused(self):
+    def test_a_term_sent_by_a_stale_client_is_ignored_not_obeyed(self):
+        # The field is gone from the contract. A caller that still sends it
+        # must not be able to grant a decade — it is simply not read.
         response = self.client.post(
             reverse('kraios_admin:user-subscription', args=[self.customer.pk]),
-            {'planId': 'plan-studio', 'durationDays': 100000},
+            {'planId': 'plan-studio', 'billingCycle': 'Monthly', 'durationDays': 100000},
             format='json',
         )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['subscriptionDetail']['durationDays'], 30)
 
 
 class GeneratedPasswordTests(APITestCase):
@@ -817,7 +831,7 @@ class CustomerBillingTests(AdminTestCase):
         self.authenticate()
         assigned = self.client.post(
             reverse('kraios_admin:user-subscription', args=[self.customer.pk]),
-            {'planId': plan['id'], 'billingCycle': 'Monthly', 'durationDays': 30},
+            {'planId': plan['id'], 'billingCycle': 'Monthly'},
             format='json',
         )
         self.assertEqual(assigned.status_code, status.HTTP_200_OK, assigned.data)
@@ -845,7 +859,7 @@ class CustomerBillingTests(AdminTestCase):
         self.authenticate()
         self.client.post(
             reverse('kraios_admin:user-subscription', args=[self.customer.pk]),
-            {'planId': plan['id'], 'billingCycle': 'Monthly', 'durationDays': 30},
+            {'planId': plan['id'], 'billingCycle': 'Monthly'},
             format='json',
         )
         self.client.logout()
@@ -858,14 +872,86 @@ class CustomerBillingTests(AdminTestCase):
 
         self.assertEqual(subscription['status'], 'Past Due')
 
+    def test_usage_is_reported_against_the_plan_the_account_is_on(self):
+        plan = self.create_plan()
+
+        self.authenticate()
+        self.client.post(
+            reverse('kraios_admin:user-subscription', args=[self.customer.pk]),
+            {'planId': plan['id'], 'billingCycle': 'Monthly'},
+            format='json',
+        )
+        self.client.logout()
+        self.client.cookies.clear()
+
+        self.as_customer()
+        response = self.client.get(reverse('kraios_billing:usage'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['hasPlan'])
+
+        by_key = {row['key']: row for row in response.data['usage']}
+        # The cap comes from the plan, not from anywhere this endpoint decides.
+        self.assertEqual(by_key['projects']['limit'], self.PLAN['projectLimit'])
+        self.assertEqual(by_key['projects']['used'], 0)
+        self.assertEqual(by_key['projects']['remaining'], self.PLAN['projectLimit'])
+
+    def test_the_unmetered_api_cap_is_not_reported_to_the_customer(self):
+        # The plan payload withholds `apiLimit` because nothing counts API
+        # requests; the usage payload has to agree, or the page shows a meter
+        # for an allowance the pricing card never mentioned.
+        plan = self.create_plan()
+
+        self.authenticate()
+        self.client.post(
+            reverse('kraios_admin:user-subscription', args=[self.customer.pk]),
+            {'planId': plan['id'], 'billingCycle': 'Monthly'},
+            format='json',
+        )
+        self.client.logout()
+        self.client.cookies.clear()
+
+        self.as_customer()
+        keys = {row['key'] for row in self.client.get(reverse('kraios_billing:usage')).data['usage']}
+
+        self.assertNotIn('apiRequests', keys)
+        self.assertIn('projects', keys)
+
+    def test_an_account_with_no_plan_gets_counts_but_no_caps(self):
+        # A meter drawn at 0% against a cap that does not exist reads as
+        # "nothing used", which is the opposite of the truth — so an
+        # unsubscribed account reports every limit as null and says so once.
+        self.as_customer()
+        response = self.client.get(reverse('kraios_billing:usage'))
+
+        self.assertFalse(response.data['hasPlan'])
+        self.assertIsNone(response.data['overallPercent'])
+        self.assertTrue(response.data['usage'])
+        for row in response.data['usage']:
+            self.assertIsNone(row['limit'])
+            self.assertIsNone(row['percent'])
+
+    def test_usage_counts_only_the_callers_own_work(self):
+        # The endpoint takes no id — it reads `request.user`. Asserted so it can
+        # never grow one.
+        from projects.models import Project
+
+        Project.objects.create(owner=self.customer, name='Mine')
+        Project.objects.create(owner=self.admin_user, name='Somebody else\'s')
+
+        self.as_customer()
+        by_key = {
+            row['key']: row
+            for row in self.client.get(reverse('kraios_billing:usage')).data['usage']
+        }
+
+        self.assertEqual(by_key['projects']['used'], 1)
+
     def test_billing_needs_a_session(self):
-        self.assertEqual(
-            self.client.get(self.plans_url).status_code, status.HTTP_401_UNAUTHORIZED
-        )
-        self.assertEqual(
-            self.client.get(self.subscription_url).status_code,
-            status.HTTP_401_UNAUTHORIZED,
-        )
+        for url in (self.plans_url, self.subscription_url, reverse('kraios_billing:usage')):
+            self.assertEqual(
+                self.client.get(url).status_code, status.HTTP_401_UNAUTHORIZED, url
+            )
 
     def test_a_customer_cannot_reach_the_console_catalogue(self):
         # The same records, the other door. A customer session must not open it.
@@ -1291,7 +1377,7 @@ class OnboardingJourneyTests(AdminTestCase):
         # 6. And puts the account on the plan agreed during the call.
         assigned = self.client.post(
             reverse('kraios_admin:user-subscription', args=[applicant.pk]),
-            {'plan': 'Studio', 'billingCycle': 'Monthly', 'durationDays': 45},
+            {'plan': 'Studio', 'billingCycle': 'Monthly'},
             format='json',
         )
         subscription = assigned.data['subscriptionDetail']
@@ -1299,7 +1385,7 @@ class OnboardingJourneyTests(AdminTestCase):
         self.assertEqual(subscription['status'], 'Active')
         self.assertEqual(
             subscription['renewalDate'],
-            (timezone.now().date() + timedelta(days=45)).isoformat(),
+            (timezone.now().date() + timedelta(days=30)).isoformat(),
         )
 
         # 7. Now, and only now, the customer can sign in.

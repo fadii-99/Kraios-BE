@@ -298,6 +298,58 @@ def _job_snapshot_asset(job):
     ).first()
 
 
+# The keys `_extract_floor_plan_geometry` (ai_pipeline.py) caches on the 2D
+# image asset. Everything else in that metadata dict describes the asset itself
+# and has to survive.
+GEOMETRY_CACHE_KEYS = ('floorplan_json', 'floorplan_data', 'fidelity')
+
+
+def _geometry_cache_asset(version):
+    """The 2D image a 3D generate block cached its extracted plan JSON on.
+
+    A generation extracts the floor plan's geometry and stores it in
+    `ProjectAsset.metadata` (`_floor_plan_geometry`), keyed to the *2D* asset
+    so later renders and the BOQ context reuse it rather than paying for a
+    second extraction. That asset belongs to the 2D block, not this one, so it
+    correctly outlives the render — but the JSON on it was produced here and
+    used to outlive the render too: deleting a 3D block took the image, the
+    job and the camera snapshot while the plan JSON stayed, and the next
+    generation silently rebuilt the same snapshot and the same prompt from it.
+
+    Only a GENERATED version reaches the extraction — an edit or an angle
+    works from its parent's render and never reads the geometry — so only
+    those clear the cache.
+    """
+    if version.source != ThreeDVersion.GENERATED:
+        return None
+    floor_plan = version.floor_plan
+    if floor_plan is None:
+        return None
+    return floor_plan.image
+
+
+def _forget_cached_geometry(asset):
+    """Drop the cached plan JSON so the next render extracts the plan again.
+
+    Called after the asset sweep, and re-read from the database rather than
+    trusted in memory: the same asset may have just been deleted along with
+    the block, and the sweep does not refresh the rows it keeps.
+    """
+    stored = ProjectAsset.objects.filter(id=asset.id).first()
+    if stored is None:
+        return
+    metadata = stored.metadata or {}
+    remaining = {
+        key: value
+        for key, value in metadata.items()
+        if key not in GEOMETRY_CACHE_KEYS
+    }
+    if len(remaining) == len(metadata):
+        return
+    stored.metadata = remaining
+    stored.save(update_fields=['metadata'])
+
+
 def _asset_is_referenced(asset, ignore_attachments=False):
     """Whether anything other than the block being deleted still needs `asset`.
 
@@ -401,12 +453,20 @@ def delete_message_block(message):
     message at all, so both are gathered here too. Without that, deleting a
     BOQ block removed the prompt and one table while the reply's own compiled
     table and any edited copy stayed on screen.
+
+    Not every trace of a block is a row of its own. A 3D generation caches the
+    plan JSON it extracted on the 2D image asset and the BOQ agent keeps its
+    own transcript outside the database, so both are cleared here as well —
+    otherwise a deleted block went on feeding the next generation the geometry
+    and the answers it had produced.
     """
     # Split by ownership: what this block produced always goes, while what
     # its message merely attached for context is only removed when nothing
     # else still needs it.
     owned_assets = []
     borrowed_assets = []
+    # 2D assets carrying plan JSON this block's generation cached there.
+    geometry_cache_assets = []
 
     def take_version_assets(version):
         for asset in (version.image, version.mask):
@@ -429,6 +489,11 @@ def delete_message_block(message):
         if three_d_version is not None:
             take_version_assets(three_d_version)
             job = three_d_version.job
+            # Read before the version goes: `floor_plan` is the only route
+            # back to the asset the extracted geometry was cached on.
+            geometry_asset = _geometry_cache_asset(three_d_version)
+            if geometry_asset is not None:
+                geometry_cache_assets.append(geometry_asset)
             # The camera snapshot this render was built from. Guarded rather
             # than owned: a client can point a second generation at the same
             # snapshot, and that reference is only in the other job's
@@ -476,6 +541,9 @@ def delete_message_block(message):
             project_id = asset.project_id
             asset.file.delete(save=False)
             asset.delete()
+
+        for asset in geometry_cache_assets:
+            _forget_cached_geometry(asset)
 
         if project_id is not None:
             _prune_empty_asset_directories(project_id)

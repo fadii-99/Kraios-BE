@@ -855,9 +855,28 @@ class ProjectWorkflowAPITests(APITestCase):
         self.assertEqual(three_d_response.status_code, status.HTTP_202_ACCEPTED)
         version = ThreeDVersion.objects.get(id=three_d_response.data['id'])
 
-        snapshot_id = (version.job.parameters or {}).get('snapshot_asset_id')
-        self.assertIsNotNone(snapshot_id)
-        snapshot = ProjectAsset.objects.get(id=snapshot_id)
+        # Stand in for `_backend_snapshot`, which only runs with the AI
+        # pipeline enabled: an asset on no FK and in no attachments, recorded
+        # in the job's parameters and nowhere else.
+        snapshot = ProjectAsset.objects.create(
+            project=project,
+            uploaded_by=self.user,
+            kind=ProjectAsset.THREE_D_SNAPSHOT,
+            file=SimpleUploadedFile(
+                'three-d-snapshot.png', b'snapshot', content_type='image/png'
+            ),
+            original_name='three-d-snapshot.png',
+            content_type='image/png',
+            size=len(b'snapshot'),
+            metadata={'source': 'backend_massing_snapshot'},
+        )
+        version.job.parameters = {
+            **(version.job.parameters or {}),
+            'snapshot_asset_id': str(snapshot.id),
+        }
+        version.job.save(update_fields=['parameters'])
+
+        snapshot_id = snapshot.id
         snapshot_name = snapshot.file.name
         storage = snapshot.file.storage
 
@@ -1361,6 +1380,115 @@ class AIPipelineContractTests(APITestCase):
             'Living Room',
         )
 
+    @patch('app.ai.guided_rendering.analyze_floorplan_verified_sync')
+    @patch('app.ai.guided_rendering.generate_guided_render_checked')
+    def test_deleting_a_three_d_block_forgets_the_plan_json_it_cached(
+        self,
+        guided,
+        analyze,
+    ):
+        """The extracted geometry is cached on the 2D asset, which the block
+        only borrows, so it survived the delete that took the render, the job
+        and the snapshot — and the next generation reused the stale JSON."""
+        from app.ai.floorplan_schema import FloorPlan
+
+        project, floor_plan = self.create_step_two_project()
+        guided.return_value = self.guided_result()
+        analyze.return_value = (FloorPlan.model_validate_json(FLOOR_PLAN_JSON), None)
+
+        generate_response = self.client.post(
+            reverse('projects:three-d-generate', args=[project.id]),
+            {
+                'prompt': 'Generate a faithful render.',
+                'floor_plan_version_id': str(floor_plan.id),
+            },
+            format='json',
+        )
+        self.assertEqual(generate_response.status_code, status.HTTP_202_ACCEPTED)
+        version = ThreeDVersion.objects.get(id=generate_response.data['id'])
+        floor_plan.image.refresh_from_db()
+        self.assertIn('floorplan_json', floor_plan.image.metadata)
+
+        delete_response = self.client.delete(
+            reverse(
+                'projects:message-delete',
+                args=[project.id, version.prompt_message_id],
+            )
+        )
+        self.assertEqual(delete_response.status_code, status.HTTP_200_OK)
+
+        # The 2D asset belongs to Step 1 and stays; only the JSON this block
+        # extracted onto it goes, along with the rest of the block.
+        floor_plan.image.refresh_from_db()
+        self.assertNotIn('floorplan_json', floor_plan.image.metadata)
+        self.assertNotIn('floorplan_data', floor_plan.image.metadata)
+        self.assertNotIn('fidelity', floor_plan.image.metadata)
+        self.assertTrue(floor_plan.image.metadata['ai_pipeline'])
+
+        # So a re-run extracts the plan again instead of rendering from the
+        # geometry the deleted block left behind.
+        rerun_response = self.client.post(
+            reverse('projects:three-d-generate', args=[project.id]),
+            {
+                'prompt': 'Generate a faithful render.',
+                'floor_plan_version_id': str(floor_plan.id),
+            },
+            format='json',
+        )
+        self.assertEqual(rerun_response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(analyze.call_count, 2)
+
+    @patch('app.ai_service.edit_3d_chat')
+    @patch('app.ai.guided_rendering.analyze_floorplan_verified_sync')
+    @patch('app.ai.guided_rendering.generate_guided_render_checked')
+    def test_deleting_a_three_d_edit_block_keeps_the_plan_json(
+        self,
+        guided,
+        analyze,
+        edit,
+    ):
+        """An edit renders from its parent image and never reads the geometry,
+        so it must not drop a cache the generation it was edited from needs."""
+        from app.ai.floorplan_schema import FloorPlan
+
+        project, floor_plan = self.create_step_two_project()
+        guided.return_value = self.guided_result()
+        analyze.return_value = (FloorPlan.model_validate_json(FLOOR_PLAN_JSON), None)
+        edit.return_value = self.guided_result()
+
+        generate_response = self.client.post(
+            reverse('projects:three-d-generate', args=[project.id]),
+            {
+                'prompt': 'Generate a faithful render.',
+                'floor_plan_version_id': str(floor_plan.id),
+            },
+            format='json',
+        )
+        generated = ThreeDVersion.objects.get(id=generate_response.data['id'])
+
+        edit_response = self.client.post(
+            reverse('projects:three-d-generate', args=[project.id]),
+            {
+                'prompt': 'Warm up the lighting.',
+                'original_version_id': str(generated.id),
+            },
+            format='json',
+        )
+        self.assertEqual(edit_response.status_code, status.HTTP_202_ACCEPTED)
+        edited = ThreeDVersion.objects.get(id=edit_response.data['id'])
+        self.assertEqual(edited.source, ThreeDVersion.EDITED)
+
+        delete_response = self.client.delete(
+            reverse(
+                'projects:message-delete',
+                args=[project.id, edited.prompt_message_id],
+            )
+        )
+        self.assertEqual(delete_response.status_code, status.HTTP_200_OK)
+
+        floor_plan.image.refresh_from_db()
+        self.assertIn('floorplan_json', floor_plan.image.metadata)
+
     @patch('app.ai.guided_rendering.generate_guided_render_checked')
     def test_adapter_calls_official_guided_renderer_with_snapshot(self, guided):
         project, floor_plan = self.create_step_two_project()
@@ -1716,3 +1844,252 @@ class AIPipelineContractTests(APITestCase):
         )
         self.assertEqual(approve_response.status_code, status.HTTP_200_OK)
         self.assertEqual(str(project.id), str(approve_response.data['id']))
+
+
+class SnapshotOpeningsTests(unittest.TestCase):
+    """The Step 2 camera reference must actually contain the openings.
+
+    `prompts.INPUTS_PREAMBLE` tells the render model that this image holds
+    "every wall, room, door and window opening in its TRUE position" and is
+    "the SOLE authority" for geometry, and forbids it from taking geometry off
+    the 2D drawing instead. For a long time the image held none of them, so the
+    model had to invent every door and window — which is what showed up as
+    layout drift in the generated renders. These tests are the guard on that
+    promise.
+    """
+
+    @staticmethod
+    def _plan(openings):
+        from app.ai.floorplan_schema import FloorPlan
+
+        corners = [(0.0, 0.0), (8.0, 0.0), (8.0, 6.0), (0.0, 6.0)]
+        return FloorPlan(
+            wall_height=2.7,
+            outline=list(corners),
+            walls=[
+                {'start': corners[i], 'end': corners[(i + 1) % 4], 'thickness': 0.2}
+                for i in range(4)
+            ],
+            openings=openings,
+            rooms=[{'name': 'Room', 'polygon': list(corners)}],
+        )
+
+    @staticmethod
+    def _colour_counts(plan):
+        import io
+
+        from PIL import Image
+
+        from app.ai.floorplan_snapshot_renderer import (
+            _DOOR_VOID,
+            _WINDOW_GLASS,
+            render_floorplan_snapshot_bytes,
+        )
+
+        with Image.open(io.BytesIO(render_floorplan_snapshot_bytes(plan))) as image:
+            colours = dict(
+                (colour, count) for count, colour in image.convert('RGB').getcolors(1 << 20)
+            )
+        return colours.get(_DOOR_VOID, 0), colours.get(_WINDOW_GLASS, 0)
+
+    def test_a_plan_with_no_openings_draws_none(self):
+        doors, windows = self._colour_counts(self._plan([]))
+
+        self.assertEqual(doors, 0)
+        self.assertEqual(windows, 0)
+
+    def test_a_door_and_a_window_are_both_drawn(self):
+        doors, windows = self._colour_counts(
+            self._plan([
+                {'type': 'door', 'wall_index': 0, 'offset': 1.0, 'width': 0.9,
+                 'height': 2.1, 'sill': 0.0},
+                {'type': 'window', 'wall_index': 1, 'offset': 1.5, 'width': 1.6,
+                 'height': 1.2, 'sill': 0.9},
+            ])
+        )
+
+        self.assertGreater(doors, 0, 'the door was not drawn')
+        self.assertGreater(windows, 0, 'the window was not drawn')
+
+    def test_an_opening_running_past_its_wall_is_clamped_rather_than_dropped(self):
+        """An 8 m wall with a 6 m door at 5 m along it still gets a door — the
+        3 m that fits — instead of one floating past the corner."""
+        doors, _ = self._colour_counts(
+            self._plan([
+                {'type': 'door', 'wall_index': 0, 'offset': 5.0, 'width': 6.0,
+                 'height': 2.1, 'sill': 0.0},
+            ])
+        )
+
+        self.assertGreater(doors, 0)
+
+    def test_an_opening_taller_than_its_wall_is_clamped(self):
+        doors, _ = self._colour_counts(
+            self._plan([
+                {'type': 'door', 'wall_index': 0, 'offset': 1.0, 'width': 0.9,
+                 'height': 5.5, 'sill': 0.0},
+            ])
+        )
+
+        self.assertGreater(doors, 0)
+
+    def test_a_zero_area_opening_draws_nothing_and_does_not_raise(self):
+        doors, _ = self._colour_counts(
+            self._plan([
+                {'type': 'door', 'wall_index': 0, 'offset': 8.0, 'width': 0.9,
+                 'height': 2.1, 'sill': 0.0},
+            ])
+        )
+
+        self.assertEqual(doors, 0)
+
+    def test_the_canvas_contract_is_unchanged(self):
+        """The render prompt tells the model to reproduce this frame verbatim,
+        so its size is part of the contract, not a detail."""
+        import io
+
+        from PIL import Image
+
+        from app.ai.floorplan_snapshot_renderer import render_floorplan_snapshot_bytes
+
+        with Image.open(io.BytesIO(render_floorplan_snapshot_bytes(self._plan([])))) as image:
+            self.assertEqual(image.size, (CANVAS_W, CANVAS_H))
+
+
+class DimensionScheduleTests(unittest.TestCase):
+    """The dimension schedule handed to the render model.
+
+    Its one non-negotiable property is that a chain's parts sum to the whole.
+    The render used to label a 13.20 m building's two halves 6.10 m and 6.70 m,
+    which is what happens when an image model is asked to derive dimensions
+    instead of copy them.
+    """
+
+    @staticmethod
+    def _plan(rooms, width=10.0, depth=8.0):
+        from app.ai.floorplan_schema import FloorPlan
+
+        return FloorPlan(
+            outline=[(0.0, 0.0), (width, 0.0), (width, depth), (0.0, depth)],
+            walls=[{'start': (0.0, 0.0), 'end': (width, 0.0), 'thickness': 0.2}],
+            rooms=rooms,
+        )
+
+    @staticmethod
+    def _box(name, x1, y1, x2, y2):
+        return {'name': name, 'polygon': [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]}
+
+    @staticmethod
+    def _chain_total(text, keyword):
+        for line in text.splitlines():
+            if keyword in line:
+                return float(line.rsplit('= ', 1)[1].split(' m')[0])
+        return None
+
+    def test_a_chain_sums_to_the_overall_width(self):
+        from app.ai.dimensions import dimension_facts
+
+        plan = self._plan([
+            self._box('Left', 0.0, 0.0, 4.0, 8.0),
+            self._box('Right', 4.2, 0.0, 10.0, 8.0),
+        ])
+
+        text = dimension_facts(plan)
+
+        self.assertEqual(self._chain_total(text, 'Across the'), 10.0)
+        self.assertIn('4.00 (Left)', text)
+        self.assertIn('0.20 (wall)', text)
+        self.assertIn('5.80 (Right)', text)
+
+    def test_a_noise_gap_is_absorbed_rather_than_dropped(self):
+        """A 2 cm gap is not a dimension, but discarding it left the chain
+        summing to less than the building — the exact defect this prevents."""
+        from app.ai.dimensions import dimension_facts
+
+        plan = self._plan([
+            self._box('Left', 0.0, 0.0, 4.0, 8.0),
+            self._box('Right', 4.02, 0.0, 10.0, 8.0),
+        ])
+
+        text = dimension_facts(plan)
+
+        self.assertEqual(self._chain_total(text, 'Across the'), 10.0)
+        self.assertNotIn('0.02', text)
+
+    def test_a_trailing_remainder_never_disappears(self):
+        from app.ai.dimensions import dimension_facts
+
+        plan = self._plan([
+            self._box('Left', 0.0, 0.0, 4.0, 8.0),
+            self._box('Right', 4.2, 0.0, 9.97, 8.0),
+        ])
+
+        self.assertEqual(
+            self._chain_total(dimension_facts(plan), 'Across the'), 10.0
+        )
+
+    def test_a_single_room_gets_no_chain_because_it_would_repeat_the_overall(self):
+        from app.ai.dimensions import dimension_facts
+
+        text = dimension_facts(self._plan([self._box('Only', 0.0, 0.0, 10.0, 8.0)]))
+
+        self.assertIn('10.00 m wide x 8.00 m deep', text)
+        self.assertNotIn('Across the', text)
+
+    def test_a_wall_and_an_untraced_space_are_labelled_differently(self):
+        from app.ai.dimensions import dimension_facts
+
+        narrow = self._plan([
+            self._box('A', 0.0, 0.0, 4.0, 8.0),
+            self._box('B', 4.2, 0.0, 10.0, 8.0),
+        ])
+        wide = self._plan([
+            self._box('A', 0.0, 0.0, 4.0, 8.0),
+            self._box('B', 6.0, 0.0, 10.0, 8.0),
+        ])
+
+        self.assertIn('wall', dimension_facts(narrow))
+        self.assertIn('unlabelled space', dimension_facts(wide))
+
+    def test_the_chain_is_cut_where_it_names_the_most_rooms(self):
+        """A row of balconies must not win over the row of real rooms."""
+        from app.ai.dimensions import dimension_facts
+
+        plan = self._plan([
+            self._box('Balcony', 0.0, 7.0, 10.0, 8.0),
+            self._box('Room A', 0.0, 0.0, 3.0, 6.0),
+            self._box('Room B', 3.2, 0.0, 6.5, 6.0),
+            self._box('Room C', 6.7, 0.0, 10.0, 6.0),
+        ])
+
+        text = dimension_facts(plan)
+
+        self.assertIn('Room A', text)
+        self.assertIn('Room C', text)
+        self.assertEqual(self._chain_total(text, 'Across the'), 10.0)
+
+    def test_a_plan_with_no_rooms_yields_no_chain_but_still_states_the_extent(self):
+        from app.ai.dimensions import dimension_facts
+
+        text = dimension_facts(self._plan([]))
+
+        self.assertIn('10.00 m wide x 8.00 m deep', text)
+        self.assertNotIn('Across the', text)
+
+    def test_the_schedule_reaches_the_render_prompt(self):
+        from app.ai.guided_rendering import _geometry_facts
+
+        plan = self._plan([
+            self._box('Left', 0.0, 0.0, 4.0, 8.0),
+            self._box('Right', 4.2, 0.0, 10.0, 8.0),
+        ])
+
+        facts = _geometry_facts(plan.model_dump_json())
+
+        self.assertIn('DIMENSION SCHEDULE', facts)
+        self.assertIn('Across the 10.00 m width', facts)
+
+    def test_a_broken_plan_fails_open_instead_of_breaking_the_render(self):
+        from app.ai.guided_rendering import _geometry_facts
+
+        self.assertEqual(_geometry_facts('not json at all'), '')

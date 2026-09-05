@@ -331,19 +331,20 @@ def generate_user_password(user, admin_profile, *, request=None):
     return user, email_sent
 
 
-def assign_subscription(user, plan_id, billing_cycle, duration_days, admin_profile, *, request=None):
+def assign_subscription(user, plan_id, billing_cycle, admin_profile, *, request=None):
     """
-    Put an account on a plan for a fixed period.
+    Put an account on a plan for the period its billing cycle names.
 
-    The record lives in the placeholder store, not the database - see
-    ``dummy_data``. The audit entry, which IS in the database, is what makes the
-    assignment traceable in the meantime.
+    The cycle is the ONLY period input - see ``dummy_data.assign_subscription``.
+    The record lives in the placeholder store, not the database; the audit
+    entry, which IS in the database, is what makes the assignment traceable in
+    the meantime, and it records the resolved end date rather than the cycle
+    alone so a later reader does not have to know today's mapping.
     """
     subscription, errors = dummy_data.assign_subscription(
         user.pk,
         plan_id,
         billing_cycle,
-        duration_days,
         assigned_by=admin_profile.user.email,
     )
 
@@ -358,7 +359,7 @@ def assign_subscription(user, plan_id, billing_cycle, duration_days, admin_profi
         'subscription.assign',
         target_type='user',
         target_id=user.pk,
-        summary=f'{subscription["plan"]} for {subscription["durationDays"]} days - {user.email}',
+        summary=f'{subscription["plan"]} ({subscription["billingCycle"]}) until {subscription["renewalDate"]} - {user.email}',
         metadata={
             'planId': subscription['planId'],
             'billingCycle': subscription['billingCycle'],

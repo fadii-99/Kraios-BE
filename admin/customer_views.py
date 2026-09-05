@@ -33,6 +33,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import dummy_data, representations
+from .services_usage import (
+    EMPTY_USAGE,
+    overall_usage_percent,
+    usage_breakdown,
+    usage_by_user,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -68,4 +74,56 @@ class CustomerSubscriptionAPIView(APIView):
 
         return Response({
             'subscription': representations.serialize_customer_subscription(subscription),
+        })
+
+
+class CustomerUsageAPIView(APIView):
+    """
+    ``GET`` what this account has used, against what its plan allows.
+
+    THE OTHER HALF OF A PLAN. The catalogue says an account may have 30
+    projects; only this says it has used 11 of them. Without it a customer can
+    read their allowance and has no way to know how much of it is left, which
+    is the one billing question they actually ask.
+
+    THE SAME NUMBERS THE CONSOLE SEES. ``usage_by_user`` and ``usage_breakdown``
+    are the functions behind the admin Usage screen, called here with the
+    caller's own id. There is no second count to drift: if the console says an
+    account has generated 40 renders, so does this.
+
+    ``limit`` and ``percent`` are ``None`` for an uncapped metric and for EVERY
+    metric when the account has no plan — a meter drawn at 0% against a cap
+    that does not exist reads as "nothing used", which is the opposite of what
+    is true. The caller renders a count without a bar in that case.
+
+    ``apiRequests`` is dropped for the same reason its cap is withheld from
+    ``serialize_customer_plan``: nothing meters it. Publishing "0 of 25,000 API
+    requests" beside a plan card that does not mention an API allowance would
+    be the product promising something it has no way to count.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    # Metrics a customer is not shown, by key. Kept as a set rather than
+    # filtered inline so adding one is a decision somebody has to write down.
+    HIDDEN_METRICS = frozenset({'apiRequests'})
+
+    def get(self, request):
+        user_id = request.user.pk
+
+        usage = usage_by_user([user_id]).get(user_id, EMPTY_USAGE)
+
+        subscription = dummy_data.get_subscription(user_id)
+        plan = dummy_data.get_plan(subscription['planId']) if subscription else None
+
+        return Response({
+            'usage': [
+                row
+                for row in usage_breakdown(usage, plan)
+                if row['key'] not in self.HIDDEN_METRICS
+            ],
+            'overallPercent': overall_usage_percent(usage, plan) if plan else None,
+            # Stated rather than left to be inferred from null limits, so the
+            # page can say "no plan" once instead of eight times.
+            'hasPlan': plan is not None,
         })

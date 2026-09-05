@@ -83,9 +83,22 @@ DEFAULT_SUPPORT_PRIORITY = 'Medium'
 # The default activation period an administrator gets when they do not name
 # one, and the bounds a custom deal may set. Two years is an arbitrary ceiling
 # that is still far beyond any deal anybody has described.
-DEFAULT_SUBSCRIPTION_DAYS = 30
-MIN_SUBSCRIPTION_DAYS = 1
-MAX_SUBSCRIPTION_DAYS = 730
+# How long an activation runs, DERIVED from the billing cycle and from nothing
+# else.
+#
+# There used to be a separate `durationDays` an administrator picked, so a plan
+# could be sold at the monthly rate but run for three months. That only makes
+# sense where something charges money on a cycle - here nothing does, so the
+# two fields could disagree and one of them was always a lie: "Annual" with a
+# 30-day term recorded PS1,928/yr on an account whose access ended in a month,
+# and the customer's own billing page said so.
+#
+# One choice now. Monthly means 30 days at the monthly rate; Annual means 365
+# at the annual one. The word and the end date can no longer contradict.
+SUBSCRIPTION_DAYS_BY_CYCLE = {
+    'Monthly': 30,
+    'Annual': 365,
+}
 
 # An annual cycle is billed at twelve months less 15%, the same discount the
 # public pricing page quotes. Computed rather than stored so the two cannot
@@ -577,29 +590,22 @@ def all_subscriptions():
         }
 
 
-def assign_subscription(user_id, plan_id, billing_cycle, duration_days, assigned_by=''):
+def assign_subscription(user_id, plan_id, billing_cycle, assigned_by=''):
     """
-    Put one account on a plan for a fixed number of days.
+    Put one account on a plan, for the period its billing cycle names.
 
-    There is no payment gateway, so activation is an administrative act with an
-    explicit end date rather than a recurring charge. ``duration_days`` defaults
-    to 30 and is clamped, so a typo cannot grant a decade.
+    ONE CHOICE, NOT TWO. The cycle decides both the price and the end date -
+    Monthly is 30 days at the monthly rate, Annual is 365 at the annual one.
+    There is no payment gateway, so an activation is an administrative grant
+    with an explicit end date rather than a recurring charge; nothing renews
+    itself and nothing is ever billed.
+
+    Re-assigning the same plan is a RENEWAL: the term restarts from today.
     """
     if billing_cycle not in BILLING_CYCLES:
         return None, {'billingCycle': 'Choose a billing cycle'}
 
-    try:
-        duration = int(duration_days or DEFAULT_SUBSCRIPTION_DAYS)
-    except (TypeError, ValueError):
-        return None, {'durationDays': 'Duration must be a whole number of days'}
-
-    if duration < MIN_SUBSCRIPTION_DAYS or duration > MAX_SUBSCRIPTION_DAYS:
-        return None, {
-            'durationDays': (
-                f'Duration must be between {MIN_SUBSCRIPTION_DAYS} and '
-                f'{MAX_SUBSCRIPTION_DAYS} days'
-            )
-        }
+    duration = SUBSCRIPTION_DAYS_BY_CYCLE[billing_cycle]
 
     with _StoreSession() as session:
         plan = next((row for row in session.data['plans'] if row['id'] == plan_id), None)

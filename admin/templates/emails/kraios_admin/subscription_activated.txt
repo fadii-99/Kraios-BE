@@ -2,7 +2,9 @@ Hello {{ full_name }},
 
 Your {{ plan }} plan is now active on your Kraios account.
 
-Active for: {{ duration_days }} days
-Renews on:  {{ renewal_date }}
+Billing:    {{ billing_cycle }}
+Runs until: {{ expires_on }} ({{ duration_days }} days)
+
+Your plan does not renew automatically. We will be in touch before it ends.
 
 Kraios Team

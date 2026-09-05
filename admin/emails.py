@@ -144,7 +144,10 @@ def send_subscription_activated(user, subscription):
         {
             'full_name': user.full_name,
             'plan': subscription.get('plan'),
-            'renewal_date': subscription.get('renewalDate'),
+            'billing_cycle': subscription.get('billingCycle'),
             'duration_days': subscription.get('durationDays'),
+            # NOT a renewal date. Nothing renews itself - there is no gateway
+            # and no recurring charge - so the template says "runs until".
+            'expires_on': subscription.get('renewalDate'),
         },
     )

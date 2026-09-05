@@ -10,7 +10,11 @@ Read-only by design - see ``customer_views``.
 """
 from django.urls import path
 
-from .customer_views import CustomerPlanListAPIView, CustomerSubscriptionAPIView
+from .customer_views import (
+    CustomerPlanListAPIView,
+    CustomerSubscriptionAPIView,
+    CustomerUsageAPIView,
+)
 
 
 app_name = 'kraios_billing'
@@ -18,4 +22,5 @@ app_name = 'kraios_billing'
 urlpatterns = [
     path('plans/', CustomerPlanListAPIView.as_view(), name='plans'),
     path('subscription/', CustomerSubscriptionAPIView.as_view(), name='subscription'),
+    path('usage/', CustomerUsageAPIView.as_view(), name='usage'),
 ]

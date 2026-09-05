@@ -599,7 +599,6 @@ class UserDetailAPIView(AdminAPIView):
             user,
             plan['id'],
             (current or {}).get('billingCycle') or plan['billingCycle'],
-            (current or {}).get('durationDays') or dummy_data.DEFAULT_SUBSCRIPTION_DAYS,
             self.admin_profile,
             request=self.request,
         )
@@ -664,7 +663,6 @@ class UserSubscriptionAPIView(AdminAPIView):
                 user,
                 plan_id,
                 data['billingCycle'],
-                data['durationDays'],
                 self.admin_profile,
                 request=request,
             )

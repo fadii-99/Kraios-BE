@@ -87,11 +87,17 @@ class UserStatusSerializer(serializers.Serializer):
 
 class SubscriptionAssignSerializer(serializers.Serializer):
     """
-    Assign a plan for a fixed period.
+    Assign a plan. Two fields, because there are only two decisions.
 
     A plan is named either by id (what the console's plan list carries) or by
     display name (what the Change Subscription dropdown carries). Exactly one
     is required, and the view resolves it against the catalogue.
+
+    THERE IS NO `durationDays`. How long the activation runs is derived from
+    `billingCycle` - Monthly is 30 days, Annual is 365 - because a term chosen
+    separately from the cycle could contradict it, and one of the two was then
+    always wrong on the customer's own billing page. A payload that still sends
+    it is ignored rather than refused; the field simply is not read.
     """
 
     planId = serializers.CharField(max_length=64, required=False, allow_blank=True)
@@ -99,12 +105,6 @@ class SubscriptionAssignSerializer(serializers.Serializer):
     billingCycle = serializers.ChoiceField(
         choices=dummy_data.BILLING_CYCLES,
         default='Monthly',
-    )
-    durationDays = serializers.IntegerField(
-        required=False,
-        min_value=dummy_data.MIN_SUBSCRIPTION_DAYS,
-        max_value=dummy_data.MAX_SUBSCRIPTION_DAYS,
-        default=dummy_data.DEFAULT_SUBSCRIPTION_DAYS,
     )
 
     def validate(self, attrs):

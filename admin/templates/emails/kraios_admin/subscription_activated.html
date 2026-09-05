@@ -9,8 +9,10 @@
               <td style="padding:32px">
                 <h1 style="margin:0 0 20px;font-size:24px">Your {{ plan }} plan is active</h1>
                 <p>Hello {{ full_name }},</p>
-                <p><strong>Active for:</strong> {{ duration_days }} days<br>
-                   <strong>Renews on:</strong> {{ renewal_date }}</p>
+                <p><strong>Billing:</strong> {{ billing_cycle }}<br>
+                   <strong>Runs until:</strong> {{ expires_on }} ({{ duration_days }} days)</p>
+                <p style="color:#5a6b7f;font-size:14px">Your plan does not renew
+                   automatically. We will be in touch before it ends.</p>
               </td>
             </tr>
           </table>

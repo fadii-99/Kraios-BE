@@ -85,7 +85,7 @@ pair; twenty from one IP locks the host.
 | PATCH  | `users/<id>/`                   | `{name, firm, email, country, jobTitle, phone, accountStatus, subscription}` — all optional                                            |
 | POST   | `users/<id>/status/`            | `{status: "Active"\|"Inactive"}`                                                                                                         |
 | POST   | `users/<id>/generate-password/` | no body — issues credentials, activates, emails                                                                                          |
-| POST   | `users/<id>/subscription/`      | `{planId \| plan, billingCycle, durationDays}`                                                                                           |
+| POST   | `users/<id>/subscription/`      | `{planId \| plan, billingCycle}`                                                                                           |
 | DELETE | `users/<id>/subscription/`      | takes the account off every plan                                                                                                          |
 
 `generate-password` returns the updated account plus
@@ -151,11 +151,33 @@ unchecked.
 | GET/POST         | `plans/`             | list / create                                                                |
 | GET/PATCH/DELETE | `plans/<id>/`        | delete returns`409` while accounts are on it                               |
 | POST             | `plans/<id>/status/` | `{status: "Active"\|"Inactive"}`                                            |
+| POST/DELETE      | `users/<id>/subscription/` | activate `{planId \| plan, billingCycle}` / remove |
 | GET              | `usage/`             | `search`, `subscription`, `firm`, `status=near\|normal`, sort, paging |
 | GET              | `usage/firms/`       | the firm filter's options                                                    |
 | GET              | `support/`           | `search`, `status`, `priority`, `topic`, sort, paging          |
 | GET/PATCH        | `support/<id>/`      | PATCH takes any of`{status, priority, assignee}`                           |
 | GET              | `audit-logs/`        | **(P)** `action`, `target_type`, `admin_email`, paging           |
+
+**Activating a plan** is `POST users/<id>/subscription/` and takes TWO things:
+the plan (`planId` or `plan`) and `billingCycle`. There is no `durationDays` —
+the cycle IS the term:
+
+| billingCycle | price | runs for |
+| ------------ | ----- | -------- |
+| `Monthly`  | the plan's price        | 30 days  |
+| `Annual`   | price x 12 x 0.85 (15% off) | 365 days |
+
+A separately chosen term used to exist and was removed: nothing charges money
+on a cycle here, so the two fields could disagree and one was always a lie —
+"Annual" with a 30-day term wrote a yearly price onto an account whose access
+ended in a month, and the customer's own billing page repeated it. A payload
+that still sends `durationDays` is ignored, not refused.
+
+There is no payment gateway: an activation is an administrative grant with an
+explicit end date, and when that date passes the subscription resolves to
+`Past Due` on both the console and the customer's billing page. Re-posting the
+same plan is a RENEWAL — the term restarts from today — which is why it is not
+refused as a no-op. Only an `Active` plan can be assigned.
 
 **Plan bodies.** `POST plans/` and `PATCH plans/<id>/` both take the WHOLE
 plan — the PATCH is a replacement, not a merge — and require `name`,
@@ -175,9 +197,15 @@ rows through a different door, with a different field set:
 | ------ | ------------------------------- | ------------------------------------------- |
 | GET    | `/api/v1/billing/plans/`        | `{plans: [...]}` — ACTIVE plans only, cheapest first |
 | GET    | `/api/v1/billing/subscription/` | `{subscription: {...} \| null}` — the caller's own |
+| GET    | `/api/v1/billing/usage/`        | `{usage: [...], overallPercent, hasPlan}` — the caller's own |
 
 Read-only: there is no gateway, so a plan is granted by an administrator
 through `users/<id>/subscription/` and there is nothing for a customer to POST.
+
+`/billing/usage/` calls the same `services_usage` functions the console's Usage
+screen does, with the caller's own id — there is no second tally. The
+`apiRequests` metric is filtered out (`CustomerUsageAPIView.HIDDEN_METRICS`) for
+the same reason `apiLimit` is withheld: nothing counts it.
 
 `serialize_customer_plan` withholds `status` (an administrative switch),
 `subscribers` (how many accounts are on the plan) and `apiLimit` (a cap on
@@ -303,8 +331,9 @@ Three console-side changes are unavoidable because the product changed:
 1. **`sendPasswordSetup` becomes `generatePassword`.** It issues the password
    rather than inviting the customer to choose one, and the response carries
    `credentialsEmailSent`, which the toast should reflect.
-2. **`changeSubscription` gains `durationDays`.** Default 30; the dialog should
-   offer a custom period for a negotiated deal.
+2. **`changeSubscription` takes only `billingCycle`.** The cycle is also the
+   term (Monthly 30 days, Annual 365), so the dialog offers plan and cycle and
+   nothing else time-shaped.
 3. **Meeting status gains `outcome`.** The Meetings page needs a control for
    "successful / not continuing / follow-up", because that is what unlocks
    Generate Password.

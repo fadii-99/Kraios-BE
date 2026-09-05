@@ -40,4 +40,7 @@ urlpatterns = [
     # subscription - the console's records, a different reader, a different
     # field set. See admin/customer_urls.py.
     path('api/v1/billing/', include('admin.customer_urls')),
+    # The BIM engine. Self-contained: this line, one entry in INSTALLED_APPS,
+    # and the `bim` package are the whole feature. See bim/README.md.
+    path('api/v1/bim/', include('bim.urls')),
 ]
